@@ -215,6 +215,10 @@ void felica_listener_reset(FelicaListener* instance) {
     instance->rc_written = false;
     memset(instance->auth.session_key.data, 0, FELICA_DATA_BLOCK_SIZE);
 
+    // Reset Standard auth state
+    memset(&instance->std_auth, 0, sizeof(instance->std_auth));
+    instance->std_auth.state = FelicaStdAuthIdle;
+
     memcpy(instance->data->data.fs.mc.data, instance->mc_shadow.data, FELICA_DATA_BLOCK_SIZE);
 
     felica_wcnt_post_process(instance->data);

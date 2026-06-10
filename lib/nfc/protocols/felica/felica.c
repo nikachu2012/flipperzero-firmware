@@ -179,6 +179,13 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
             system->system_code = system_code;
             system->system_code_idx = sys_idx;
 
+            // System key (optional)
+            furi_string_printf(str_key_buffer, "System %02X Key", sys_idx);
+            if(flipper_format_key_exist(ff, furi_string_get_cstr(str_key_buffer))) {
+                system->has_system_key = flipper_format_read_hex(
+                    ff, furi_string_get_cstr(str_key_buffer), system->system_key, FELICA_STD_KEY_SIZE);
+            }
+
             // Areas
             do {
                 uint32_t area_count = 0;
@@ -203,6 +210,15 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                            &area->first_idx,
                            &area->last_idx) != 3) {
                         break;
+                    }
+                    // Area key (optional)
+                    furi_string_printf(str_key_buffer, "Area %03X Key", i);
+                    if(flipper_format_key_exist(ff, furi_string_get_cstr(str_key_buffer))) {
+                        area->has_key = flipper_format_read_hex(
+                            ff,
+                            furi_string_get_cstr(str_key_buffer),
+                            area->key,
+                            FELICA_STD_KEY_SIZE);
                     }
                 }
             } while(false);
@@ -233,6 +249,15 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                         break;
                     }
                     service->attr = service->code & 0x3F;
+                    // Service key (optional)
+                    furi_string_printf(str_key_buffer, "Service %03X Key", i);
+                    if(flipper_format_key_exist(ff, furi_string_get_cstr(str_key_buffer))) {
+                        service->has_key = flipper_format_read_hex(
+                            ff,
+                            furi_string_get_cstr(str_key_buffer),
+                            service->key,
+                            FELICA_STD_KEY_SIZE);
+                    }
                 }
             } while(false);
 
@@ -360,6 +385,15 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
             if(!flipper_format_write_string(
                    ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                 break;
+            if(system->has_system_key) {
+                furi_string_printf(str_key_buffer, "System %02X Key", (uint8_t)sys_idx);
+                if(!flipper_format_write_hex(
+                       ff,
+                       furi_string_get_cstr(str_key_buffer),
+                       system->system_key,
+                       FELICA_STD_KEY_SIZE))
+                    break;
+            }
             if(!flipper_format_write_empty_line(ff)) break;
 
             do {
@@ -387,6 +421,15 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
                     if(!flipper_format_write_string(
                            ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                         break;
+                    if(area->has_key) {
+                        furi_string_printf(str_key_buffer, "Area %03X Key", i);
+                        if(!flipper_format_write_hex(
+                               ff,
+                               furi_string_get_cstr(str_key_buffer),
+                               area->key,
+                               FELICA_STD_KEY_SIZE))
+                            break;
+                    }
                 }
                 if(!flipper_format_write_empty_line(ff)) break;
 
@@ -408,6 +451,15 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
                     if(!flipper_format_write_string(
                            ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                         break;
+                    if(service->has_key) {
+                        furi_string_printf(str_key_buffer, "Service %03X Key", i);
+                        if(!flipper_format_write_hex(
+                               ff,
+                               furi_string_get_cstr(str_key_buffer),
+                               service->key,
+                               FELICA_STD_KEY_SIZE))
+                            break;
+                    }
                 }
                 if(!flipper_format_write_empty_line(ff)) break;
 

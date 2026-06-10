@@ -95,7 +95,8 @@ struct FelicaListener {
     Nfc* nfc;
     FelicaData* data;
     FelicaListenerState state;
-    FelicaAuthentication auth;
+    FelicaAuthentication auth;     /**< FeliCa Lite-S authentication context */
+    FelicaStdAuth std_auth;        /**< FeliCa Standard mutual authentication state */
     FelicaBlockData mc_shadow;
 
     uint8_t request_size_buf;

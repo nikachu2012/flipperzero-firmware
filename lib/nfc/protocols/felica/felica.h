@@ -13,8 +13,16 @@ extern "C" {
 #define FELICA_PMM_SIZE        (8U)
 #define FELICA_DATA_BLOCK_SIZE (16U)
 
-#define FELICA_CMD_READ_WITHOUT_ENCRYPTION  (0x06U)
-#define FELICA_CMD_WRITE_WITHOUT_ENCRYPTION (0x08U)
+#define FELICA_CMD_READ_WITHOUT_ENCRYPTION   (0x06U)
+#define FELICA_CMD_WRITE_WITHOUT_ENCRYPTION  (0x08U)
+#define FELICA_CMD_AUTHENTICATION1           (0x10U)
+#define FELICA_CMD_AUTHENTICATION1_RESP      (0x11U)
+#define FELICA_CMD_AUTHENTICATION2           (0x12U)
+#define FELICA_CMD_AUTHENTICATION2_RESP      (0x13U)
+
+#define FELICA_STD_KEY_SIZE                  (8U)
+#define FELICA_STD_CHALLENGE_SIZE            (8U)
+#define FELICA_STD_MAX_AUTH_SERVICES         (16U)
 
 #define FELICA_SERVICE_RW_ACCESS (0x0009U)
 #define FELICA_SERVICE_RO_ACCESS (0x000BU)
@@ -170,12 +178,16 @@ typedef union {
 typedef struct {
     uint16_t code;
     uint8_t attr;
+    bool has_key;
+    uint8_t key[FELICA_STD_KEY_SIZE];
 } FelicaService;
 
 typedef struct {
     uint16_t code;
     uint16_t first_idx;
     uint16_t last_idx;
+    bool has_key;
+    uint8_t key[FELICA_STD_KEY_SIZE];
 } FelicaArea;
 
 typedef struct {
@@ -190,7 +202,28 @@ typedef struct {
     SimpleArray* services;
     SimpleArray* areas;
     SimpleArray* public_blocks;
+    bool has_system_key;
+    uint8_t system_key[FELICA_STD_KEY_SIZE];
 } FelicaSystem;
+
+/** @brief State machine for FeliCa Standard mutual authentication */
+typedef enum {
+    FelicaStdAuthIdle,
+    FelicaStdAuthAuth1Done,
+    FelicaStdAuthAuthenticated,
+} FelicaStdAuthState;
+
+/** @brief Runtime state for FeliCa Standard mutual authentication session */
+typedef struct {
+    FelicaStdAuthState state;
+    uint8_t r1[FELICA_STD_CHALLENGE_SIZE]; /**< Reader's random challenge */
+    uint8_t r2[FELICA_STD_CHALLENGE_SIZE]; /**< Card's random challenge */
+    uint8_t user_service_key[FELICA_STD_KEY_SIZE]; /**< Derived user service key (for 1A/1B) */
+    uint8_t gsk_xor_idm[FELICA_STD_KEY_SIZE]; /**< Group service key XOR IDm (for 2A/2B) */
+    uint16_t counter; /**< Anti-replay counter */
+    uint8_t authorized_service_count;
+    uint16_t authorized_services[FELICA_STD_MAX_AUTH_SERVICES];
+} FelicaStdAuth;
 
 /** @brief Structure used to store Felica data and additional values about reading */
 typedef struct {
