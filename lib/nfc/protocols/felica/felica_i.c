@@ -28,6 +28,9 @@ void felica_system_copy(FelicaSystem* system, const FelicaSystem* other) {
     system->system_code = other->system_code;
     system->system_code_idx = other->system_code_idx;
     system->key_version = other->key_version;
+    memcpy(system->system_key, other->system_key, 8);
+    memcpy(system->idi, other->idi, 8);
+    memcpy(system->pmi, other->pmi, 8);
     simple_array_copy(system->services, other->services);
     simple_array_copy(system->areas, other->areas);
     simple_array_copy(system->public_blocks, other->public_blocks);

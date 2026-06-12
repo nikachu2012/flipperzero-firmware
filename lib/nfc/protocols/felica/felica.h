@@ -58,6 +58,18 @@ extern "C" {
 #define FELICA_CMD_LIST_SERVICE_CODE_RESP   0x0B
 #define FELICA_CMD_REQUEST_SYSTEM_CODE      0x0C
 #define FELICA_CMD_REQUEST_SYSTEM_CODE_RESP 0x0D
+#define FELICA_CMD_AUTHENTICATION1          0x10
+#define FELICA_CMD_AUTHENTICATION1_RESP     0x11
+#define FELICA_CMD_AUTHENTICATION2          0x12
+#define FELICA_CMD_AUTHENTICATION2_RESP     0x13
+#define FELICA_CMD_READ                     0x14
+#define FELICA_CMD_READ_RESP                0x15
+#define FELICA_CMD_WRITE                    0x16
+#define FELICA_CMD_WRITE_RESP               0x17
+#define FELICA_CMD_READ_ENCRYPTED           0x30
+#define FELICA_CMD_READ_ENCRYPTED_RESP      0x31
+#define FELICA_CMD_WRITE_ENCRYPTED          0x32
+#define FELICA_CMD_WRITE_ENCRYPTED_RESP     0x33
 
 #define FELICA_SERVICE_ATTRIBUTE_UNAUTH_READ    (0b000001)
 #define FELICA_SERVICE_ATTRIBUTE_READ_ONLY      (0b000010)
@@ -175,6 +187,7 @@ typedef struct {
     uint16_t code;
     uint8_t attr;
     uint16_t key_version;
+    uint8_t key[8];
 } FelicaService;
 
 typedef struct {
@@ -183,6 +196,7 @@ typedef struct {
     uint16_t first_idx;
     uint16_t last_idx;
     uint16_t key_version;
+    uint8_t key[8];
 } FelicaArea;
 
 typedef struct {
@@ -195,6 +209,9 @@ typedef struct {
     uint8_t system_code_idx;
     uint16_t system_code;
     uint16_t key_version;
+    uint8_t system_key[8];
+    uint8_t idi[8];
+    uint8_t pmi[8];
     SimpleArray* services;
     SimpleArray* areas;
     SimpleArray* public_blocks;
@@ -339,6 +356,22 @@ void felica_get_workflow_type(FelicaData* data);
 void felica_get_ic_name(const FelicaData* data, FuriString* ic_name);
 
 void felica_service_get_attribute_string(const FelicaService* service, FuriString* str);
+
+void felica_des_ecb_encrypt(const uint8_t* key8, const uint8_t* in8, uint8_t* out8);
+void felica_des_ecb_decrypt(const uint8_t* key8, const uint8_t* in8, uint8_t* out8);
+
+void felica_des_derive_group_service_key(
+    const FelicaSystem* system,
+    const uint16_t* area_codes,
+    uint8_t n,
+    uint8_t* group_key_out);
+
+void felica_des_derive_user_service_key(
+    const uint8_t* group_key,
+    const FelicaSystem* system,
+    const uint16_t* service_codes,
+    uint8_t o,
+    uint8_t* user_key_out);
 
 #ifdef __cplusplus
 }

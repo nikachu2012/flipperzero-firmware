@@ -105,6 +105,19 @@ struct FelicaListener {
     bool rc_written;
     uint8_t mode;
 
+    // FeliCa Standard DES mutual authentication state
+    uint8_t des_auth_state; // 0=none, 1=auth1 done, 2=auth2 done
+    uint8_t r1[8];
+    uint8_t r2[8];
+    uint8_t des_user_key[8];
+    uint8_t des_group_key[8];
+    uint16_t des_comm_counter;
+    uint16_t auth_area_codes[16];
+    uint8_t auth_area_count;
+    uint16_t auth_service_codes[16];
+    uint8_t auth_service_count;
+    uint8_t auth_system_idx;
+
     BitBuffer* tx_buffer;
     BitBuffer* rx_buffer;
 

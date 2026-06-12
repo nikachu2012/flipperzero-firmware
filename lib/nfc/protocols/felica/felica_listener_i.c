@@ -187,10 +187,16 @@ bool felica_listener_check_block_list_size(
         return true;
     }
 
-    // Standard mode uses multi-service packet format; parsing done in command handlers
+    // Standard mode: auth and encrypted commands have variable-length payloads parsed in handlers
     if(instance->data->workflow_type == FelicaStandard &&
        (req->header.code == FELICA_CMD_READ_WITHOUT_ENCRYPTION ||
-        req->header.code == FELICA_CMD_WRITE_WITHOUT_ENCRYPTION)) {
+        req->header.code == FELICA_CMD_WRITE_WITHOUT_ENCRYPTION ||
+        req->header.code == FELICA_CMD_AUTHENTICATION1 ||
+        req->header.code == FELICA_CMD_AUTHENTICATION2 ||
+        req->header.code == FELICA_CMD_READ_ENCRYPTED ||
+        req->header.code == FELICA_CMD_WRITE_ENCRYPTED ||
+        req->header.code == FELICA_CMD_READ ||
+        req->header.code == FELICA_CMD_WRITE)) {
         return true;
     }
 
@@ -229,6 +235,17 @@ void felica_listener_reset(FelicaListener* instance) {
     instance->rc_written = false;
     instance->mode = 0;
     memset(instance->auth.session_key.data, 0, FELICA_DATA_BLOCK_SIZE);
+
+    // Reset DES Standard auth state
+    instance->des_auth_state = 0;
+    instance->des_comm_counter = 0;
+    instance->auth_area_count = 0;
+    instance->auth_service_count = 0;
+    instance->auth_system_idx = 0;
+    memset(instance->r1, 0, 8);
+    memset(instance->r2, 0, 8);
+    memset(instance->des_user_key, 0, 8);
+    memset(instance->des_group_key, 0, 8);
 
     memcpy(instance->data->data.fs.mc.data, instance->mc_shadow.data, FELICA_DATA_BLOCK_SIZE);
 

@@ -187,6 +187,69 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                 sscanf(sys_kv_ptr, "Key version %04hX", &system->key_version);
             }
 
+            // Try to read system key (optional, default zeros for backward compat)
+            memset(system->system_key, 0, 8);
+            const char* sys_key_ptr =
+                strstr(furi_string_get_cstr(str_data_buffer), "System key: ");
+            if(sys_key_ptr) {
+                sys_key_ptr += 12;
+                unsigned int b[8] = {0};
+                sscanf(
+                    sys_key_ptr,
+                    "%02X %02X %02X %02X %02X %02X %02X %02X",
+                    &b[0],
+                    &b[1],
+                    &b[2],
+                    &b[3],
+                    &b[4],
+                    &b[5],
+                    &b[6],
+                    &b[7]);
+                for(int ki = 0; ki < 8; ki++) system->system_key[ki] = (uint8_t)b[ki];
+            }
+
+            // Try to read IDi (optional, default zeros for backward compat)
+            memset(system->idi, 0, 8);
+            const char* sys_idi_ptr =
+                strstr(furi_string_get_cstr(str_data_buffer), "IDi: ");
+            if(sys_idi_ptr) {
+                sys_idi_ptr += 5;
+                unsigned int b[8] = {0};
+                sscanf(
+                    sys_idi_ptr,
+                    "%02X %02X %02X %02X %02X %02X %02X %02X",
+                    &b[0],
+                    &b[1],
+                    &b[2],
+                    &b[3],
+                    &b[4],
+                    &b[5],
+                    &b[6],
+                    &b[7]);
+                for(int ki = 0; ki < 8; ki++) system->idi[ki] = (uint8_t)b[ki];
+            }
+
+            // Try to read PMi (optional, default zeros for backward compat)
+            memset(system->pmi, 0, 8);
+            const char* sys_pmi_ptr =
+                strstr(furi_string_get_cstr(str_data_buffer), "PMi: ");
+            if(sys_pmi_ptr) {
+                sys_pmi_ptr += 5;
+                unsigned int b[8] = {0};
+                sscanf(
+                    sys_pmi_ptr,
+                    "%02X %02X %02X %02X %02X %02X %02X %02X",
+                    &b[0],
+                    &b[1],
+                    &b[2],
+                    &b[3],
+                    &b[4],
+                    &b[5],
+                    &b[6],
+                    &b[7]);
+                for(int ki = 0; ki < 8; ki++) system->pmi[ki] = (uint8_t)b[ki];
+            }
+
             // Areas
             do {
                 uint32_t area_count = 0;
@@ -233,6 +296,27 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                             area->end_code = 0xFFFF;
                         }
                     }
+
+                    // Optional area key (default zeros)
+                    memset(area->key, 0, 8);
+                    const char* area_key_ptr =
+                        strstr(furi_string_get_cstr(str_data_buffer), "Key: ");
+                    if(area_key_ptr) {
+                        area_key_ptr += 5;
+                        unsigned int b[8] = {0};
+                        sscanf(
+                            area_key_ptr,
+                            "%02X %02X %02X %02X %02X %02X %02X %02X",
+                            &b[0],
+                            &b[1],
+                            &b[2],
+                            &b[3],
+                            &b[4],
+                            &b[5],
+                            &b[6],
+                            &b[7]);
+                        for(int ki = 0; ki < 8; ki++) area->key[ki] = (uint8_t)b[ki];
+                    }
                 }
             } while(false);
 
@@ -269,6 +353,27 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                         strstr(furi_string_get_cstr(str_data_buffer), "Key version ");
                     if(svc_kv_ptr) {
                         sscanf(svc_kv_ptr, "Key version %04hX", &service->key_version);
+                    }
+
+                    // Optional service key (default zeros)
+                    memset(service->key, 0, 8);
+                    const char* svc_key_ptr =
+                        strstr(furi_string_get_cstr(str_data_buffer), "Key: ");
+                    if(svc_key_ptr) {
+                        svc_key_ptr += 5;
+                        unsigned int b[8] = {0};
+                        sscanf(
+                            svc_key_ptr,
+                            "%02X %02X %02X %02X %02X %02X %02X %02X",
+                            &b[0],
+                            &b[1],
+                            &b[2],
+                            &b[3],
+                            &b[4],
+                            &b[5],
+                            &b[6],
+                            &b[7]);
+                        for(int ki = 0; ki < 8; ki++) service->key[ki] = (uint8_t)b[ki];
                     }
                 }
             } while(false);
@@ -395,9 +500,33 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
             furi_string_printf(str_key_buffer, "\n\nSystem %02X", (uint8_t)sys_idx);
             furi_string_printf(
                 str_data_buffer,
-                "%04X | Key version %04X |",
+                "%04X | Key version %04X | System key: %02X %02X %02X %02X %02X %02X %02X %02X | IDi: %02X %02X %02X %02X %02X %02X %02X %02X | PMi: %02X %02X %02X %02X %02X %02X %02X %02X |",
                 system->system_code,
-                system->key_version);
+                system->key_version,
+                system->system_key[0],
+                system->system_key[1],
+                system->system_key[2],
+                system->system_key[3],
+                system->system_key[4],
+                system->system_key[5],
+                system->system_key[6],
+                system->system_key[7],
+                system->idi[0],
+                system->idi[1],
+                system->idi[2],
+                system->idi[3],
+                system->idi[4],
+                system->idi[5],
+                system->idi[6],
+                system->idi[7],
+                system->pmi[0],
+                system->pmi[1],
+                system->pmi[2],
+                system->pmi[3],
+                system->pmi[4],
+                system->pmi[5],
+                system->pmi[6],
+                system->pmi[7]);
             if(!flipper_format_write_string(
                    ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                 break;
@@ -421,12 +550,20 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
                     furi_string_printf(str_key_buffer, "Area %03X", i);
                     furi_string_printf(
                         str_data_buffer,
-                        "| Code %04X | End %04X | Services #%03X-#%03X | Key version %04X |",
+                        "| Code %04X | End %04X | Services #%03X-#%03X | Key version %04X | Key: %02X %02X %02X %02X %02X %02X %02X %02X |",
                         area->code,
                         area->end_code,
                         area->first_idx,
                         area->last_idx,
-                        area->key_version);
+                        area->key_version,
+                        area->key[0],
+                        area->key[1],
+                        area->key[2],
+                        area->key[3],
+                        area->key[4],
+                        area->key[5],
+                        area->key[6],
+                        area->key[7]);
                     if(!flipper_format_write_string(
                            ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                         break;
@@ -449,7 +586,17 @@ bool felica_save(const FelicaData* data, FlipperFormat* ff) {
                         service->attr);
                     felica_service_get_attribute_string(service, str_data_buffer);
                     furi_string_cat_printf(
-                        str_data_buffer, " Key version %04X |", service->key_version);
+                        str_data_buffer,
+                        " Key version %04X | Key: %02X %02X %02X %02X %02X %02X %02X %02X |",
+                        service->key_version,
+                        service->key[0],
+                        service->key[1],
+                        service->key[2],
+                        service->key[3],
+                        service->key[4],
+                        service->key[5],
+                        service->key[6],
+                        service->key[7]);
                     if(!flipper_format_write_string(
                            ff, furi_string_get_cstr(str_key_buffer), str_data_buffer))
                         break;
@@ -550,6 +697,76 @@ bool felica_set_uid(FelicaData* data, const uint8_t* uid, size_t uid_len) {
 FelicaData* felica_get_base_data(const FelicaData* data) {
     UNUSED(data);
     furi_crash("No base data");
+}
+
+void felica_des_ecb_encrypt(const uint8_t* key8, const uint8_t* in8, uint8_t* out8) {
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_enc(&ctx, key8);
+    mbedtls_des_crypt_ecb(&ctx, in8, out8);
+    mbedtls_des_free(&ctx);
+}
+
+void felica_des_ecb_decrypt(const uint8_t* key8, const uint8_t* in8, uint8_t* out8) {
+    mbedtls_des_context ctx;
+    mbedtls_des_init(&ctx);
+    mbedtls_des_setkey_dec(&ctx, key8);
+    mbedtls_des_crypt_ecb(&ctx, in8, out8);
+    mbedtls_des_free(&ctx);
+}
+
+void felica_des_derive_group_service_key(
+    const FelicaSystem* system,
+    const uint16_t* area_codes,
+    uint8_t n,
+    uint8_t* group_key_out) {
+    furi_check(system);
+    furi_check(group_key_out);
+
+    uint8_t result[8];
+    memcpy(result, system->system_key, 8);
+
+    for(uint8_t i = 0; i < n; i++) {
+        uint32_t area_count = simple_array_get_count(system->areas);
+        for(uint32_t j = 0; j < area_count; j++) {
+            const FelicaArea* area = simple_array_cget(system->areas, j);
+            if(area->code == area_codes[i]) {
+                uint8_t tmp[8];
+                felica_des_ecb_encrypt(area->key, result, tmp);
+                memcpy(result, tmp, 8);
+                break;
+            }
+        }
+    }
+    memcpy(group_key_out, result, 8);
+}
+
+void felica_des_derive_user_service_key(
+    const uint8_t* group_key,
+    const FelicaSystem* system,
+    const uint16_t* service_codes,
+    uint8_t o,
+    uint8_t* user_key_out) {
+    furi_check(group_key);
+    furi_check(system);
+    furi_check(user_key_out);
+
+    uint8_t result[8];
+    memcpy(result, group_key, 8);
+
+    for(uint8_t i = 0; i < o; i++) {
+        uint32_t svc_count = simple_array_get_count(system->services);
+        for(uint32_t j = 0; j < svc_count; j++) {
+            const FelicaService* svc = simple_array_cget(system->services, j);
+            if(svc->code == service_codes[i]) {
+                uint8_t tmp[8];
+                felica_des_ecb_encrypt(svc->key, result, tmp);
+                memcpy(result, tmp, 8);
+                break;
+            }
+        }
+    }
+    memcpy(user_key_out, result, 8);
 }
 
 static void felica_reverse_copy_block(const uint8_t* array, uint8_t* reverse_array) {
