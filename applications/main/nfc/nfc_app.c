@@ -349,8 +349,10 @@ bool nfc_load_file(NfcApp* instance, FuriString* path, bool show_dialog) {
     nfc_supported_cards_load_cache(instance->nfc_supported_cards);
 
     FuriString* load_path = furi_string_alloc();
+    bool loading_shadow = false;
     if(nfc_has_shadow_file_internal(instance, path)) { //-V1051
         nfc_set_shadow_file_path(path, load_path);
+        loading_shadow = true;
     } else if(furi_string_end_with(path, NFC_APP_SHADOW_EXTENSION)) {
         size_t path_len = furi_string_size(path);
         furi_string_set_n(load_path, path, 0, path_len - 4);
@@ -360,6 +362,21 @@ bool nfc_load_file(NfcApp* instance, FuriString* path, bool show_dialog) {
     }
 
     result = nfc_device_load(instance->nfc_device, furi_string_get_cstr(load_path));
+
+    // A shadow created by an older parser can contain lossy FeliCa block indices.
+    // If protocol validation rejects it, preserve the shadow and load the original
+    // .nfc file instead. A later shadow save will replace it with corrected data.
+    if(!result && loading_shadow) {
+        FURI_LOG_W("NfcApp", "Invalid NFC shadow, falling back to original file");
+        if(furi_string_end_with(path, NFC_APP_SHADOW_EXTENSION)) {
+            const size_t path_len = furi_string_size(path);
+            furi_string_set_n(load_path, path, 0, path_len - 4);
+            furi_string_cat_printf(load_path, "%s", NFC_APP_EXTENSION);
+        } else {
+            furi_string_set(load_path, path);
+        }
+        result = nfc_device_load(instance->nfc_device, furi_string_get_cstr(load_path));
+    }
 
     if(result) {
         path_extract_filename(load_path, instance->file_name, true);

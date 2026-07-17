@@ -5,8 +5,7 @@
 #include <furi_hal_nfc.h>
 #include <furi_hal_random.h>
 
-#define FELICA_LISTENER_MAX_BUFFER_SIZE     (128)
-#define FELICA_LISTENER_CMD_POLLING         (0x00U)
+#define FELICA_LISTENER_MAX_BUFFER_SIZE     (256)
 #define FELICA_LISTENER_RESPONSE_POLLING    (0x01U)
 #define FELICA_LISTENER_RESPONSE_CODE_READ  (0x07)
 #define FELICA_LISTENER_RESPONSE_CODE_WRITE (0x09)
@@ -21,6 +20,16 @@
 #define FELICA_LISTENER_PERFORMANCE_VALUE (__builtin_bswap16(0x0083U))
 
 #define TAG "FelicaListener"
+
+static void felica_listener_log_hex(const char* label, const uint8_t* data, size_t len) {
+    size_t n = len < FELICA_LISTENER_MAX_BUFFER_SIZE ? len : FELICA_LISTENER_MAX_BUFFER_SIZE;
+    char hex[FELICA_LISTENER_MAX_BUFFER_SIZE * 2 + 1];
+    for(size_t i = 0; i < n; i++) {
+        snprintf(hex + i * 2, 3, "%02X", data[i]);
+    }
+    hex[n * 2] = '\0';
+    FURI_LOG_D(TAG, "%s (%zu): %s", label, len, hex);
+}
 
 FelicaListener* felica_listener_alloc(Nfc* nfc, FelicaData* data) {
     furi_assert(nfc);
@@ -37,9 +46,29 @@ FelicaListener* felica_listener_alloc(Nfc* nfc, FelicaData* data) {
 
     memcpy(instance->mc_shadow.data, instance->data->data.fs.mc.data, FELICA_DATA_BLOCK_SIZE);
     instance->data->data.fs.state.data[0] = 0;
-    instance->mode = 0;
+    instance->mode = FELICA_LISTENER_MODE_UNAUTHENTICATED;
     instance->current_system_idx = 0;
     nfc_config(instance->nfc, NfcModeListener, NfcTechFelica);
+
+    // nfc_listener_alloc() works on a copy of the loaded NFC data. Log the same
+    // boundary entries here to catch stale firmware or corruption during that copy.
+    if(simple_array_get_count(data->systems) > 0) {
+        const FelicaSystem* system = simple_array_cget(data->systems, 0);
+        const uint32_t public_block_count = simple_array_get_count(system->public_blocks);
+        const uint16_t diagnostic_entries[] = {0x19, 0x1E};
+        FURI_LOG_I(TAG, "PBHEX3 listener active: blocks=%lu", public_block_count);
+        for(size_t i = 0; i < COUNT_OF(diagnostic_entries); i++) {
+            const uint16_t entry = diagnostic_entries[i];
+            if(entry >= public_block_count) continue;
+            const FelicaPublicBlock* block = simple_array_cget(system->public_blocks, entry);
+            FURI_LOG_I(
+                TAG,
+                "PBHEX3 listener: entry=%04X service=%04X block=%02X",
+                entry,
+                block->service_code,
+                block->block_idx);
+        }
+    }
 
     // PMm bytes 2-6 encode the max response time a reader should allow per command
     // (Request Service / Request Response / Read / Write / Auth). Cards saved from a
@@ -173,8 +202,45 @@ static FelicaSystem* felica_listener_get_current_system_mut(FelicaListener* inst
     return simple_array_get(instance->data->systems, instance->current_system_idx);
 }
 
-// Max blocks for Standard read that fit within the 128-byte tx buffer (with CRC)
-#define FELICA_STANDARD_READ_BLOCK_MAX (7U)
+// Two Service Codes that share the same Service Number (bits 15:6) but differ only in
+// Attribute (bits 5:0, e.g. a Read/Write code and its Read Only "shadow" code) address
+// the same physical block storage. A dump commonly only captures block data under one
+// of the variants, so lookups must match by Service Number rather than the exact code
+// the reader authenticated with, or a legitimate read/write via the sibling code fails.
+static const FelicaPublicBlock*
+    felica_std_find_public_block(const FelicaSystem* system, uint16_t svc_code, uint16_t blk_num) {
+    uint32_t pb_count = simple_array_get_count(system->public_blocks);
+    const FelicaPublicBlock* sibling = NULL;
+    for(uint32_t j = 0; j < pb_count; j++) {
+        const FelicaPublicBlock* pb = simple_array_cget(system->public_blocks, j);
+        if(pb->block_idx != blk_num) continue;
+        if(pb->service_code == svc_code) return pb;
+        if(!sibling && (pb->service_code >> 6) == (svc_code >> 6)) sibling = pb;
+    }
+    return sibling;
+}
+
+static FelicaPublicBlock*
+    felica_std_find_public_block_mut(FelicaSystem* system, uint16_t svc_code, uint16_t blk_num) {
+    uint32_t pb_count = simple_array_get_count(system->public_blocks);
+    FelicaPublicBlock* sibling = NULL;
+    for(uint32_t j = 0; j < pb_count; j++) {
+        FelicaPublicBlock* pb = simple_array_get(system->public_blocks, j);
+        if(pb->block_idx != blk_num) continue;
+        if(pb->service_code == svc_code) return pb;
+        if(!sibling && (pb->service_code >> 6) == (svc_code >> 6)) sibling = pb;
+    }
+    return sibling;
+}
+
+// A successful response consists of the command response header, one block-count
+// byte, and 16 bytes per block. Leave room for the CRC appended before transmit.
+#define FELICA_STANDARD_READ_RESPONSE_HEADER_SIZE \
+    (sizeof(FelicaCommandResponseHeader) + sizeof(uint8_t))
+#define FELICA_STANDARD_READ_BLOCK_MAX                    \
+    ((FELICA_LISTENER_MAX_BUFFER_SIZE - FELICA_CRC_SIZE - \
+      FELICA_STANDARD_READ_RESPONSE_HEADER_SIZE) /        \
+     FELICA_DATA_BLOCK_SIZE)
 
 static FelicaError felica_listener_command_handler_standard_read(
     FelicaListener* instance,
@@ -190,10 +256,7 @@ static FelicaError felica_listener_command_handler_standard_read(
         service_codes[i] = (uint16_t)(raw[11 + i * 2] | ((uint16_t)raw[12 + i * 2] << 8));
     }
 
-    uint8_t block_count = raw[11 + service_num * 2];
-    if(block_count > FELICA_STANDARD_READ_BLOCK_MAX) {
-        block_count = FELICA_STANDARD_READ_BLOCK_MAX;
-    }
+    const uint8_t block_count = raw[11 + service_num * 2];
     const uint8_t* bptr = raw + 12 + service_num * 2;
 
     const FelicaSystem* system = felica_listener_get_current_system(instance);
@@ -202,7 +265,12 @@ static FelicaError felica_listener_command_handler_standard_read(
     uint8_t block_data[FELICA_STANDARD_READ_BLOCK_MAX][FELICA_DATA_BLOCK_SIZE];
     uint8_t actual_block_count = 0;
 
-    for(uint8_t i = 0; i < block_count; i++) {
+    if((block_count == 0) || (block_count > FELICA_STANDARD_READ_BLOCK_MAX)) {
+        sf1 = 0xFF;
+        sf2 = 0xA2;
+    }
+
+    for(uint8_t i = 0; (sf1 == 0) && (i < block_count); i++) {
         uint8_t svc_idx = bptr[0] & 0x0F;
         bool is_2byte = (bptr[0] >> 7) != 0;
         uint8_t blk_num;
@@ -222,15 +290,10 @@ static FelicaError felica_listener_command_handler_standard_read(
         }
 
         uint16_t svc_code = service_codes[svc_idx];
-        bool found = false;
-        uint32_t pb_count = simple_array_get_count(system->public_blocks);
-        for(uint32_t j = 0; j < pb_count; j++) {
-            const FelicaPublicBlock* pb = simple_array_cget(system->public_blocks, j);
-            if(pb->service_code == svc_code && pb->block_idx == blk_num) {
-                memcpy(block_data[actual_block_count], pb->block.data, FELICA_DATA_BLOCK_SIZE);
-                found = true;
-                break;
-            }
+        const FelicaPublicBlock* pb = felica_std_find_public_block(system, svc_code, blk_num);
+        bool found = pb != NULL;
+        if(found) {
+            memcpy(block_data[actual_block_count], pb->block.data, FELICA_DATA_BLOCK_SIZE);
         }
 
         if(!found) {
@@ -254,9 +317,7 @@ static FelicaError felica_listener_command_handler_standard_read(
         resp_buf[12] = actual_block_count;
         for(uint8_t i = 0; i < actual_block_count; i++) {
             memcpy(
-                resp_buf + 13 + i * FELICA_DATA_BLOCK_SIZE,
-                block_data[i],
-                FELICA_DATA_BLOCK_SIZE);
+                resp_buf + 13 + i * FELICA_DATA_BLOCK_SIZE, block_data[i], FELICA_DATA_BLOCK_SIZE);
         }
     }
 
@@ -337,16 +398,11 @@ static FelicaError felica_listener_command_handler_standard_write(
 
     if(sf1 == 0 && system) {
         for(uint8_t i = 0; i < valid_count; i++) {
-            bool found = false;
-            uint32_t pb_count = simple_array_get_count(system->public_blocks);
-            for(uint32_t j = 0; j < pb_count; j++) {
-                FelicaPublicBlock* pb = simple_array_get(system->public_blocks, j);
-                if(pb->service_code == targets[i].svc_code && pb->block_idx == targets[i].blk_num) {
-                    memcpy(
-                        pb->block.data, bptr + i * FELICA_DATA_BLOCK_SIZE, FELICA_DATA_BLOCK_SIZE);
-                    found = true;
-                    break;
-                }
+            FelicaPublicBlock* pb =
+                felica_std_find_public_block_mut(system, targets[i].svc_code, targets[i].blk_num);
+            bool found = pb != NULL;
+            if(found) {
+                memcpy(pb->block.data, bptr + i * FELICA_DATA_BLOCK_SIZE, FELICA_DATA_BLOCK_SIZE);
             }
             if(!found) {
                 sf1 = 0xFF;
@@ -563,6 +619,10 @@ static FelicaError felica_listener_command_handler_request_system_code(
 // FeliCa Standard DES mutual-authentication helpers
 // ---------------------------------------------------------------------------
 
+#define FELICA_STANDARD_COMMUNICATION_ID_SIZE          (6U)
+#define FELICA_STANDARD_AUTH2_COMMUNICATION_ID_OFFSET  (8U - FELICA_STANDARD_COMMUNICATION_ID_SIZE)
+#define FELICA_STANDARD_SECURE_COMMUNICATION_ID_OFFSET (8U - FELICA_STANDARD_COMMUNICATION_ID_SIZE)
+
 // Compute single-DES CBC encrypt/decrypt (key=8B, IV=8B)
 static void felica_std_des_cbc_encrypt(
     const uint8_t* key,
@@ -594,6 +654,54 @@ static void felica_std_des_cbc_decrypt(
     mbedtls_des_free(&ctx);
 }
 
+typedef struct {
+    uint8_t group_idm_xor[8];
+    uint8_t pcd_key[8];
+    uint8_t picc_key[8];
+} FelicaStandardMutualAuthKeys;
+
+static void felica_std_des2_ede_encrypt(
+    const uint8_t* key1,
+    const uint8_t* key2,
+    const uint8_t* input,
+    uint8_t* output) {
+    uint8_t tmp1[8];
+    uint8_t tmp2[8];
+    felica_des_ecb_encrypt(key1, input, tmp1);
+    felica_des_ecb_decrypt(key2, tmp1, tmp2);
+    felica_des_ecb_encrypt(key1, tmp2, output);
+}
+
+static void felica_std_des2_ede_decrypt(
+    const uint8_t* key1,
+    const uint8_t* key2,
+    const uint8_t* input,
+    uint8_t* output) {
+    uint8_t tmp1[8];
+    uint8_t tmp2[8];
+    felica_des_ecb_decrypt(key1, input, tmp1);
+    felica_des_ecb_encrypt(key2, tmp1, tmp2);
+    felica_des_ecb_decrypt(key1, tmp2, output);
+}
+
+static void felica_std_derive_mutual_auth_keys(
+    const uint8_t* group_key,
+    const uint8_t* user_key,
+    const FelicaIDm* idm,
+    FelicaStandardMutualAuthKeys* keys) {
+    // Diagram notation:
+    //   A = Kg XOR IDm
+    //   B = DES_A(Ks)
+    //   C = DES_B(A)
+    // PCD cryptograms (1A/2B) use 2-key EDE (B, A), while PICC cryptograms
+    // (1B/2A) use 2-key EDE (A, C).
+    for(size_t i = 0; i < sizeof(keys->group_idm_xor); i++) {
+        keys->group_idm_xor[i] = group_key[i] ^ idm->data[i];
+    }
+    felica_des_ecb_encrypt(keys->group_idm_xor, user_key, keys->pcd_key);
+    felica_des_ecb_encrypt(keys->pcd_key, keys->group_idm_xor, keys->picc_key);
+}
+
 // MAC: acc = [len, cc, 0,0,0,0,0,0]; for each 8B block of data: acc = DES_enc(acc, block_as_key)
 static void felica_std_compute_mac(
     uint8_t pkt_len,
@@ -620,37 +728,47 @@ static size_t felica_std_pkcs5_pad(const uint8_t* in, size_t len, uint8_t* out) 
 
 // ---------------------------------------------------------------------------
 // Authentication 1 handler (command 0x10)
-// Request:  Length + 0x10 + IDm(8) + n(1) + AreaCodes(2n) + o(1) + SvcCodes(2o) + 1A(8)
-// Response: Length + 0x11 + IDm(8) + 1B(8) + 2A(8)
+// Request:  Length + 0x10 + [IDm(8)] + n(1) + AreaCodes(2n) + o(1) +
+//           SvcCodes(2o) + 1A(8)
+// Response: Length + 0x11 + [IDm(8)] + 1B(8) + 2A(8)
 // ---------------------------------------------------------------------------
 static FelicaError felica_listener_command_handler_auth1(
     FelicaListener* instance,
     const FelicaListenerGenericRequest* const generic_request) {
     const uint8_t* raw = (const uint8_t*)generic_request;
-    uint8_t off = 10; // past Length(1) + 0x10(1) + IDm(8)
+    const size_t packet_len = raw[0];
+    felica_listener_log_hex("Auth1 rx", raw, packet_len);
+    if(packet_len < 2 + 1 + 1 + 8) return FelicaErrorProtocol;
 
-    uint8_t n = raw[off++];
-    if(n > 16) n = 16;
+    const FelicaIDm current_idm = felica_listener_get_current_idm(instance);
+    const bool has_idm = packet_len >= 10 &&
+                         memcmp(raw + 2, current_idm.data, sizeof(current_idm.data)) == 0;
+    size_t off = has_idm ? 10 : 2;
+
+    if(off >= packet_len) return FelicaErrorProtocol;
+    const uint8_t n = raw[off++];
+    if(n > COUNT_OF(instance->auth_area_codes) || (size_t)n * 2 > packet_len - off)
+        return FelicaErrorProtocol;
     uint16_t area_codes[16];
     for(uint8_t i = 0; i < n; i++) {
         area_codes[i] = (uint16_t)(raw[off] | ((uint16_t)raw[off + 1] << 8));
         off += 2;
     }
 
-    uint8_t o = raw[off++];
-    if(o > 16) o = 16;
+    if(off >= packet_len) return FelicaErrorProtocol;
+    const uint8_t o = raw[off++];
+    if(o > COUNT_OF(instance->auth_service_codes) || (size_t)o * 2 > packet_len - off)
+        return FelicaErrorProtocol;
     uint16_t svc_codes[16];
     for(uint8_t i = 0; i < o; i++) {
         svc_codes[i] = (uint16_t)(raw[off] | ((uint16_t)raw[off + 1] << 8));
         off += 2;
     }
 
+    if(packet_len - off != 8) return FelicaErrorProtocol;
     const uint8_t* challenge_1a = raw + off;
 
-    const FelicaSystem* system = NULL;
-    if(simple_array_get_count(instance->data->systems) > 0) {
-        system = simple_array_cget(instance->data->systems, 0);
-    }
+    const FelicaSystem* system = felica_listener_get_current_system(instance);
     if(!system) return FelicaErrorProtocol;
 
     // Derive group and user service keys
@@ -663,46 +781,55 @@ static FelicaError felica_listener_command_handler_auth1(
     memcpy(instance->des_user_key, user_key, 8);
     memcpy(instance->des_group_key, group_key, 8);
     instance->auth_area_count = n;
-    for(uint8_t i = 0; i < n; i++) instance->auth_area_codes[i] = area_codes[i];
+    for(uint8_t i = 0; i < n; i++)
+        instance->auth_area_codes[i] = area_codes[i];
     instance->auth_service_count = o;
-    for(uint8_t i = 0; i < o; i++) instance->auth_service_codes[i] = svc_codes[i];
-    instance->auth_system_idx = 0; // system 0 used (always index 0 for now)
+    for(uint8_t i = 0; i < o; i++)
+        instance->auth_service_codes[i] = svc_codes[i];
+    instance->auth_system_idx = instance->current_system_idx;
 
-    // Decrypt 1A with user key → R1
-    felica_des_ecb_decrypt(user_key, challenge_1a, instance->r1);
+    FelicaStandardMutualAuthKeys mutual_auth_keys;
+    felica_std_derive_mutual_auth_keys(group_key, user_key, &current_idm, &mutual_auth_keys);
 
-    // Alternate key for 1B/2A = group_key XOR IDm
-    uint8_t key_alt[8];
-    for(int i = 0; i < 8; i++) key_alt[i] = group_key[i] ^ instance->data->idm.data[i];
+    // Decrypt 1A with 2-key EDE (B, A) to recover R1.
+    felica_std_des2_ede_decrypt(
+        mutual_auth_keys.pcd_key, mutual_auth_keys.group_idm_xor, challenge_1a, instance->r1);
+    felica_listener_log_hex("Auth1 1A (raw)", challenge_1a, 8);
+    felica_listener_log_hex("Auth1 R1 (decrypted)", instance->r1, 8);
 
-    // Encrypt R1 → 1B
+    // Encrypt R1 with 2-key EDE (A, C) → 1B.
     uint8_t challenge_1b[8];
-    felica_des_ecb_encrypt(key_alt, instance->r1, challenge_1b);
+    felica_std_des2_ede_encrypt(
+        mutual_auth_keys.group_idm_xor, mutual_auth_keys.picc_key, instance->r1, challenge_1b);
 
-    // Generate R2 and encrypt → 2A
+    // Generate R2 and encrypt it with the same PICC-side EDE keys → 2A.
     furi_hal_random_fill_buf(instance->r2, 8);
+    felica_listener_log_hex("Auth1 R2 (generated)", instance->r2, 8);
     uint8_t challenge_2a[8];
-    felica_des_ecb_encrypt(key_alt, instance->r2, challenge_2a);
+    felica_std_des2_ede_encrypt(
+        mutual_auth_keys.group_idm_xor, mutual_auth_keys.picc_key, instance->r2, challenge_2a);
 
     instance->des_auth_state = 1;
 
-    // Build response: Length(1)+0x11(1)+IDm(8)+1B(8)+2A(8) = 26 bytes
+    // Mirror the request's optional IDm so both command variants remain interoperable.
+    const size_t response_data_offset = has_idm ? 10 : 2;
+    const size_t response_len = response_data_offset + 16;
     uint8_t resp[26];
-    resp[0] = 26;
+    resp[0] = response_len;
     resp[1] = FELICA_CMD_AUTHENTICATION1_RESP;
-    memcpy(resp + 2, instance->data->idm.data, 8);
-    memcpy(resp + 10, challenge_1b, 8);
-    memcpy(resp + 18, challenge_2a, 8);
+    if(has_idm) memcpy(resp + 2, current_idm.data, sizeof(current_idm.data));
+    memcpy(resp + response_data_offset, challenge_1b, 8);
+    memcpy(resp + response_data_offset + 8, challenge_2a, 8);
 
     bit_buffer_reset(instance->tx_buffer);
-    bit_buffer_append_bytes(instance->tx_buffer, resp, 26);
+    bit_buffer_append_bytes(instance->tx_buffer, resp, response_len);
     return felica_listener_frame_exchange(instance, instance->tx_buffer);
 }
 
 // ---------------------------------------------------------------------------
 // Authentication 2 handler (command 0x12)
-// Request:  Length + 0x12 + IDm(8) + 2B(8)
-// Response: Length + 0x13 + IDm(8) + Encrypt(counter(2)+R1[0:5](6)+IDi(8)+PMi(8)+MAC(8))
+// Request:  Length + 0x12 + [IDm(8)] + 2B(8)
+// Response: Length + 0x13 + Encrypt(counter(2)+R1[2:7](6)+IDi(8)+PMi(8)+MAC(8))
 // ---------------------------------------------------------------------------
 static FelicaError felica_listener_command_handler_auth2(
     FelicaListener* instance,
@@ -710,27 +837,53 @@ static FelicaError felica_listener_command_handler_auth2(
     if(instance->des_auth_state != 1) return FelicaErrorProtocol;
 
     const uint8_t* raw = (const uint8_t*)generic_request;
-    const uint8_t* challenge_2b = raw + 10; // past Length+0x12+IDm
+    const size_t packet_len = raw[0];
+    felica_listener_log_hex("Auth2 rx", raw, packet_len);
+    const FelicaIDm current_idm = felica_listener_get_current_idm(instance);
+    size_t challenge_offset;
+    if(packet_len == 10) {
+        challenge_offset = 2;
+    } else if(packet_len == 18 && memcmp(raw + 2, current_idm.data, sizeof(current_idm.data)) == 0) {
+        challenge_offset = 10;
+    } else {
+        return FelicaErrorProtocol;
+    }
+    const uint8_t* challenge_2b = raw + challenge_offset;
 
-    // Decrypt 2B with user key → verify equals R2
+    // Decrypt 2B with the same PCD-side EDE keys as 1A and verify R2.
+    FelicaStandardMutualAuthKeys mutual_auth_keys;
+    felica_std_derive_mutual_auth_keys(
+        instance->des_group_key, instance->des_user_key, &current_idm, &mutual_auth_keys);
     uint8_t recv_r2[8];
-    felica_des_ecb_decrypt(instance->des_user_key, challenge_2b, recv_r2);
+    felica_std_des2_ede_decrypt(
+        mutual_auth_keys.pcd_key, mutual_auth_keys.group_idm_xor, challenge_2b, recv_r2);
+    felica_listener_log_hex("Auth2 2B (raw)", challenge_2b, 8);
+    felica_listener_log_hex("Auth2 R2 (decrypted)", recv_r2, 8);
+    felica_listener_log_hex("Auth2 R2 (expected)", instance->r2, 8);
     if(memcmp(recv_r2, instance->r2, 8) != 0) return FelicaErrorProtocol;
 
     instance->des_auth_state = 2;
     instance->des_comm_counter = 0;
+    felica_listener_set_mode(instance, FELICA_LISTENER_MODE_AUTHENTICATED);
+    FURI_LOG_D(TAG, "Mutual authentication complete: Mode 3");
 
-    // Response: Length(1) + 0x13(1) + Encrypt(counter(2)+R1[0:5](6)+IDi(8)+PMi(8)+MAC(8)) = 34 bytes
+    // Response: Length(1) + 0x13(1) +
+    // Encrypt(counter(2)+communication ID R1[2:7](6)+IDi(8)+PMi(8)+MAC(8)) = 34 bytes
     // No IDm in Auth2 response (differs from standard FeliCa commands)
     const uint8_t total_len = 34; // 0x22
     const FelicaSystem* auth_system =
         simple_array_cget(instance->data->systems, instance->auth_system_idx);
 
-    // Build plaintext: counter(2) + R1[0:5](6) + IDi(8) + PMi(8) = 24 bytes
+    // Authentication 2 uses the last six bytes of R1 as its communication identifier,
+    // same as the rest of the secure communication commands.
+    // Build plaintext: counter(2) + communication ID(6) + IDi(8) + PMi(8) = 24 bytes
     uint8_t plain[24];
     plain[0] = 0; // counter low
     plain[1] = 0; // counter high
-    memcpy(plain + 2, instance->r1, 6);
+    memcpy(
+        plain + 2,
+        instance->r1 + FELICA_STANDARD_AUTH2_COMMUNICATION_ID_OFFSET,
+        FELICA_STANDARD_COMMUNICATION_ID_SIZE);
     memcpy(plain + 8, auth_system->idi, 8);
     memcpy(plain + 16, auth_system->pmi, 8);
 
@@ -758,318 +911,92 @@ static FelicaError felica_listener_command_handler_auth2(
     return felica_listener_frame_exchange(instance, instance->tx_buffer);
 }
 
-// Max blocks for encrypted read/write that fit within the tx buffer
-#define FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX (4U)
+// Max blocks per secure Read/Write, bounded by what a single encrypted response
+// or request frame can hold in the 256-byte listener buffer (incl. 2-byte CRC).
+//   Read response = 2 + PKCS#5(2+6+1+1+1 + 16N) + 8(MAC) + 2(CRC); N=14 -> 252B.
+//   Write request  = 2 + PKCS#5(2+6+1 + 2N + 16N) + 8(MAC) + 2(CRC); N=8 -> 172B.
+// Fifteen secure-read blocks would require 268 bytes after mandatory PKCS#5
+// padding, so fourteen is the largest representable response.
+#define FELICA_STANDARD_SECURE_READ_BLOCK_MAX  (14U)
+#define FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX (8U)
 
-// ---------------------------------------------------------------------------
-// Encrypted Read handler (command 0x30)
-// Request:  Length + 0x30 + IDm(8) + Encrypt(null_pad(counter(2)+R1(8)+svc_num(1)+svcs(2n)+blk_cnt(1)+blk_list+MAC(8)))
-// Response: Length + 0x31 + IDm(8) + Encrypt(pkcs5_pad(counter+1(2)+R1(8)+SF1(1)+SF2(1)+blk_cnt(1)+blk_data+MAC(8)))
-// ---------------------------------------------------------------------------
-static FelicaError felica_listener_command_handler_encrypted_read(
-    FelicaListener* instance,
-    const FelicaListenerGenericRequest* const generic_request) {
-    if(instance->des_auth_state != 2) return FelicaErrorProtocol;
+typedef struct {
+    uint8_t service_index;
+    uint16_t block_number;
+} FelicaStandardSecureBlockListElement;
 
-    const uint8_t* raw = (const uint8_t*)generic_request;
-    uint8_t pkt_len = raw[0];
-    // Encrypted payload starts at offset 10 (past Length+0x30+IDm)
-    size_t enc_len = (size_t)(pkt_len - 10);
-    if(enc_len == 0 || enc_len % 8 != 0) return FelicaErrorProtocol;
+static bool felica_std_parse_secure_block_list(
+    const uint8_t* data,
+    size_t data_len,
+    uint8_t block_count,
+    FelicaStandardSecureBlockListElement* elements,
+    size_t elements_count,
+    size_t* bytes_consumed) {
+    if((block_count == 0) || (block_count > elements_count)) return false;
 
-    const uint8_t* enc_payload = raw + 10;
+    size_t offset = 0;
+    for(uint8_t i = 0; i < block_count; i++) {
+        if(data_len - offset < 2) return false;
 
-    // Decrypt payload with R2 (CBC, IV=0)
-    uint8_t decrypted[64]; // max reasonable size
-    if(enc_len > sizeof(decrypted)) return FelicaErrorProtocol;
-    uint8_t iv[8] = {0};
-    felica_std_des_cbc_decrypt(instance->r2, iv, enc_payload, decrypted, enc_len);
+        const bool is_two_byte = (data[offset] & 0x80U) != 0;
+        const size_t element_size = is_two_byte ? 2U : 3U;
+        if(data_len - offset < element_size) return false;
 
-    // Parse inner: counter(2) + R1(8) + svc_num(1) + svc_codes(2*svc_num) + blk_cnt(1) + blk_list + MAC(8)
-    if(enc_len < 2 + 8 + 1 + 1 + 8) return FelicaErrorProtocol;
-    uint16_t counter = (uint16_t)(decrypted[0] | ((uint16_t)decrypted[1] << 8));
-
-    // Replay check
-    if(counter <= instance->des_comm_counter) return FelicaErrorProtocol;
-    // Verify R1
-    if(memcmp(decrypted + 2, instance->r1, 8) != 0) return FelicaErrorProtocol;
-
-    // Verify MAC: covers decrypted[0..enc_len-8-1], seed=[pkt_len, 0x30, 0...]
-    uint8_t expected_mac[8];
-    size_t mac_data_len = enc_len - 8; // exclude MAC at end
-    felica_std_compute_mac(pkt_len, FELICA_CMD_READ_ENCRYPTED, decrypted, mac_data_len, expected_mac);
-    if(memcmp(expected_mac, decrypted + mac_data_len, 8) != 0) return FelicaErrorProtocol;
-
-    instance->des_comm_counter = counter;
-
-    // Parse comm_data starting at offset 10
-    uint8_t inner_off = 10;
-    uint8_t svc_num = decrypted[inner_off++];
-    uint16_t svc_codes[16];
-    for(uint8_t i = 0; i < svc_num && i < 16; i++) {
-        svc_codes[i] =
-            (uint16_t)(decrypted[inner_off] | ((uint16_t)decrypted[inner_off + 1] << 8));
-        inner_off += 2;
-    }
-    uint8_t blk_cnt = decrypted[inner_off++];
-    if(blk_cnt > FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX)
-        blk_cnt = FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX;
-
-    const FelicaSystem* system = NULL;
-    if(simple_array_get_count(instance->data->systems) > 0)
-        system = simple_array_cget(instance->data->systems, 0);
-
-    uint8_t sf1 = 0, sf2 = 0;
-    uint8_t block_data[FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX][FELICA_DATA_BLOCK_SIZE];
-    uint8_t actual_cnt = 0;
-
-    for(uint8_t i = 0; i < blk_cnt; i++) {
-        uint8_t svc_idx = decrypted[inner_off] & 0x0F;
-        bool is_2byte = (decrypted[inner_off] >> 7) != 0;
-        uint8_t blk_num;
-        if(is_2byte) {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 2;
-        } else {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 3;
+        elements[i].service_index = data[offset] & 0x0FU;
+        elements[i].block_number = data[offset + 1];
+        if(!is_two_byte) {
+            elements[i].block_number |= (uint16_t)data[offset + 2] << 8;
         }
-
-        if(svc_idx >= svc_num || !system) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-        uint16_t svc_code = svc_codes[svc_idx];
-        bool found = false;
-        uint32_t pb_count = simple_array_get_count(system->public_blocks);
-        for(uint32_t j = 0; j < pb_count; j++) {
-            const FelicaPublicBlock* pb = simple_array_cget(system->public_blocks, j);
-            if(pb->service_code == svc_code && pb->block_idx == blk_num) {
-                memcpy(block_data[actual_cnt], pb->block.data, FELICA_DATA_BLOCK_SIZE);
-                found = true;
-                break;
-            }
-        }
-        if(!found) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-        actual_cnt++;
+        offset += element_size;
     }
 
-    // Build response inner plaintext: counter+1(2) + R1(8) + SF1(1)+SF2(1)+blk_cnt(1)+data
-    uint16_t resp_counter = counter + 1;
-    uint8_t resp_plain[2 + 8 + 1 + 1 + 1 + FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX * FELICA_DATA_BLOCK_SIZE];
-    size_t resp_plain_len = 0;
-    resp_plain[resp_plain_len++] = (uint8_t)(resp_counter & 0xFF);
-    resp_plain[resp_plain_len++] = (uint8_t)(resp_counter >> 8);
-    memcpy(resp_plain + resp_plain_len, instance->r1, 8);
-    resp_plain_len += 8;
-    resp_plain[resp_plain_len++] = sf1;
-    resp_plain[resp_plain_len++] = sf2;
-    if(sf1 == 0) {
-        resp_plain[resp_plain_len++] = actual_cnt;
-        for(uint8_t i = 0; i < actual_cnt; i++) {
-            memcpy(resp_plain + resp_plain_len, block_data[i], FELICA_DATA_BLOCK_SIZE);
-            resp_plain_len += FELICA_DATA_BLOCK_SIZE;
-        }
-    }
-
-    // PKCS#5 pad data first, compute MAC over padded data, append MAC at end
-    uint8_t padded_data[sizeof(resp_plain) + 8];
-    size_t padded_data_len = felica_std_pkcs5_pad(resp_plain, resp_plain_len, padded_data);
-    // final_pkt_len = 1(len)+1(code)+8(IDm)+padded_data_len+8(MAC)
-    uint8_t final_pkt_len = (uint8_t)(1 + 1 + 8 + padded_data_len + 8);
-    uint8_t resp_mac[8];
-    felica_std_compute_mac(
-        final_pkt_len, FELICA_CMD_READ_ENCRYPTED_RESP, padded_data, padded_data_len, resp_mac);
-
-    // Encrypt block = [padded_data][MAC]
-    uint8_t full[sizeof(padded_data) + 8];
-    memcpy(full, padded_data, padded_data_len);
-    memcpy(full + padded_data_len, resp_mac, 8);
-    size_t full_len = padded_data_len + 8;
-    uint8_t enc_resp[sizeof(full)];
-    memset(iv, 0, 8);
-    felica_std_des_cbc_encrypt(instance->r2, iv, full, enc_resp, full_len);
-
-    uint8_t resp_buf[128];
-    resp_buf[0] = final_pkt_len;
-    resp_buf[1] = FELICA_CMD_READ_ENCRYPTED_RESP;
-    memcpy(resp_buf + 2, instance->data->idm.data, 8);
-    memcpy(resp_buf + 10, enc_resp, full_len);
-
-    bit_buffer_reset(instance->tx_buffer);
-    bit_buffer_append_bytes(instance->tx_buffer, resp_buf, final_pkt_len);
-    return felica_listener_frame_exchange(instance, instance->tx_buffer);
+    *bytes_consumed = offset;
+    return true;
 }
 
-// ---------------------------------------------------------------------------
-// Encrypted Write handler (command 0x32)
-// Request:  Length + 0x32 + IDm(8) + Encrypt(null_pad(counter(2)+R1(8)+svc_num(1)+svcs(2n)+blk_cnt(1)+blk_list+blk_data+MAC(8)))
-// Response: Length + 0x33 + IDm(8) + Encrypt(pkcs5_pad(counter+1(2)+R1(8)+SF1(1)+SF2(1)+MAC(8)))
-// ---------------------------------------------------------------------------
-static FelicaError felica_listener_command_handler_encrypted_write(
-    FelicaListener* instance,
-    const FelicaListenerGenericRequest* const generic_request) {
-    if(instance->des_auth_state != 2) return FelicaErrorProtocol;
+// Readers in the field use both PKCS#5 and zero padding for secure requests.
+// Accept either representation; the padding remains authenticated because it is
+// included in the MAC that is verified before this function is called.
+static bool
+    felica_std_check_request_padding(const uint8_t* data, size_t data_len, size_t unpadded_len) {
+    if(unpadded_len > data_len) return false;
 
-    const uint8_t* raw = (const uint8_t*)generic_request;
-    uint8_t pkt_len = raw[0];
-    size_t enc_len = (size_t)(pkt_len - 10);
-    if(enc_len == 0 || enc_len % 8 != 0) return FelicaErrorProtocol;
+    const size_t pad_len = data_len - unpadded_len;
+    if(pad_len == 0) return true;
+    if(pad_len > 8) return false;
 
-    const uint8_t* enc_payload = raw + 10;
-    uint8_t decrypted[128];
-    if(enc_len > sizeof(decrypted)) return FelicaErrorProtocol;
-    uint8_t iv[8] = {0};
-    felica_std_des_cbc_decrypt(instance->r2, iv, enc_payload, decrypted, enc_len);
-
-    if(enc_len < 2 + 8 + 1 + 1 + 8) return FelicaErrorProtocol;
-    uint16_t counter = (uint16_t)(decrypted[0] | ((uint16_t)decrypted[1] << 8));
-    if(counter <= instance->des_comm_counter) return FelicaErrorProtocol;
-    if(memcmp(decrypted + 2, instance->r1, 8) != 0) return FelicaErrorProtocol;
-
-    // Verify MAC
-    uint8_t expected_mac[8];
-    size_t mac_data_len = enc_len - 8;
-    felica_std_compute_mac(
-        pkt_len, FELICA_CMD_WRITE_ENCRYPTED, decrypted, mac_data_len, expected_mac);
-    if(memcmp(expected_mac, decrypted + mac_data_len, 8) != 0) return FelicaErrorProtocol;
-
-    instance->des_comm_counter = counter;
-
-    uint8_t inner_off = 10;
-    uint8_t svc_num = decrypted[inner_off++];
-    uint16_t svc_codes[16];
-    for(uint8_t i = 0; i < svc_num && i < 16; i++) {
-        svc_codes[i] =
-            (uint16_t)(decrypted[inner_off] | ((uint16_t)decrypted[inner_off + 1] << 8));
-        inner_off += 2;
+    bool pkcs5_padding = true;
+    bool zero_padding = true;
+    for(size_t i = unpadded_len; i < data_len; i++) {
+        if(data[i] != pad_len) pkcs5_padding = false;
+        if(data[i] != 0) zero_padding = false;
     }
-    uint8_t blk_cnt = decrypted[inner_off++];
-    if(blk_cnt > 8) blk_cnt = 8;
+    return pkcs5_padding || zero_padding;
+}
 
-    struct {
-        uint16_t svc_code;
-        uint8_t blk_num;
-    } targets[8];
-    uint8_t valid_cnt = 0;
-    uint8_t sf1 = 0, sf2 = 0;
+static bool felica_std_check_secure_communication_id(
+    const FelicaListener* instance,
+    const uint8_t* communication_id) {
+    return memcmp(
+               communication_id,
+               instance->r1 + FELICA_STANDARD_SECURE_COMMUNICATION_ID_OFFSET,
+               FELICA_STANDARD_COMMUNICATION_ID_SIZE) == 0;
+}
 
-    const FelicaSystem* system = NULL;
-    if(simple_array_get_count(instance->data->systems) > 0)
-        system = simple_array_cget(instance->data->systems, 0);
-
-    for(uint8_t i = 0; i < blk_cnt && i < 8; i++) {
-        uint8_t svc_idx = decrypted[inner_off] & 0x0F;
-        bool is_2byte = (decrypted[inner_off] >> 7) != 0;
-        uint8_t blk_num;
-        if(is_2byte) {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 2;
-        } else {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 3;
-        }
-
-        if(svc_idx >= svc_num || !system) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-        uint16_t svc_code = svc_codes[svc_idx];
-
-        // Check service is writable
-        bool svc_found = false;
-        uint32_t svc_count = simple_array_get_count(system->services);
-        for(uint32_t k = 0; k < svc_count; k++) {
-            const FelicaService* svc = simple_array_cget(system->services, k);
-            if(svc->code == svc_code) {
-                svc_found = true;
-                if(svc->attr & FELICA_SERVICE_ATTRIBUTE_READ_ONLY) {
-                    sf1 = 0xFF;
-                    sf2 = 0xA6;
-                }
-                break;
-            }
-        }
-        if(!svc_found || sf1 != 0) break;
-
-        targets[i].svc_code = svc_code;
-        targets[i].blk_num = blk_num;
-        valid_cnt++;
-    }
-
-    // Block data follows the block list in the decrypted payload
-    if(sf1 == 0 && system) {
-        for(uint8_t i = 0; i < valid_cnt; i++) {
-            bool found = false;
-            uint32_t pb_count = simple_array_get_count(system->public_blocks);
-            for(uint32_t j = 0; j < pb_count; j++) {
-                FelicaPublicBlock* pb = simple_array_get(system->public_blocks, j);
-                if(pb->service_code == targets[i].svc_code &&
-                   pb->block_idx == targets[i].blk_num) {
-                    memcpy(
-                        pb->block.data,
-                        decrypted + inner_off + i * FELICA_DATA_BLOCK_SIZE,
-                        FELICA_DATA_BLOCK_SIZE);
-                    found = true;
-                    break;
-                }
-            }
-            if(!found) {
-                sf1 = 0xFF;
-                sf2 = 0xA8;
-                break;
-            }
-        }
-    }
-
-    // Build response inner: counter+1(2) + R1(8) + SF1(1) + SF2(1) = 12 bytes
-    uint16_t resp_counter = counter + 1;
-    uint8_t resp_plain[12];
-    resp_plain[0] = (uint8_t)(resp_counter & 0xFF);
-    resp_plain[1] = (uint8_t)(resp_counter >> 8);
-    memcpy(resp_plain + 2, instance->r1, 8);
-    resp_plain[10] = sf1;
-    resp_plain[11] = sf2;
-
-    // PKCS#5 pad data(12) first → 16 bytes, compute MAC over padded, append MAC
-    uint8_t padded_data[16 + 8];
-    size_t padded_data_len = felica_std_pkcs5_pad(resp_plain, 12, padded_data);
-    // final_pkt_len = 1(len)+1(code)+8(IDm)+padded_data_len+8(MAC)
-    uint8_t final_pkt_len = (uint8_t)(1 + 1 + 8 + padded_data_len + 8);
-    uint8_t resp_mac[8];
-    felica_std_compute_mac(
-        final_pkt_len, FELICA_CMD_WRITE_ENCRYPTED_RESP, padded_data, padded_data_len, resp_mac);
-
-    // Encrypt block = [padded_data][MAC]
-    uint8_t full[sizeof(padded_data) + 8];
-    memcpy(full, padded_data, padded_data_len);
-    memcpy(full + padded_data_len, resp_mac, 8);
-    size_t full_len = padded_data_len + 8;
-    uint8_t enc_resp[sizeof(full)];
-    memset(iv, 0, 8);
-    felica_std_des_cbc_encrypt(instance->r2, iv, full, enc_resp, full_len);
-
-    uint8_t resp_buf[42];
-    resp_buf[0] = final_pkt_len;
-    resp_buf[1] = FELICA_CMD_WRITE_ENCRYPTED_RESP;
-    memcpy(resp_buf + 2, instance->data->idm.data, 8);
-    memcpy(resp_buf + 10, enc_resp, full_len);
-
-    bit_buffer_reset(instance->tx_buffer);
-    bit_buffer_append_bytes(instance->tx_buffer, resp_buf, final_pkt_len);
-    return felica_listener_frame_exchange(instance, instance->tx_buffer);
+static bool
+    felica_std_check_command_counter(const FelicaListener* instance, uint16_t command_counter) {
+    // Keep one counter value available for the response. A new authentication is
+    // required once the two-byte counter is exhausted.
+    return instance->des_comm_counter < UINT16_MAX - 1 &&
+           command_counter == instance->des_comm_counter + 1;
 }
 
 // ---------------------------------------------------------------------------
 // Secure Read handler (command 0x14)
-// Request:  Length + 0x14 + Encrypt(null_pad(counter(2)+R1(8)+blk_cnt(1)+blk_list)+MAC(8))
-// Response: Length + 0x15 + Encrypt(pkcs5_pad(counter+1(2)+R1(8)+SF1(1)+SF2(1)+blk_cnt(1)+blk_data)+MAC(8))
+// Request:  Length + 0x14 + Encrypt(pad(counter(2)+communication_id(6)+
+//           blk_cnt(1)+blk_list)+MAC(8))
+// Response: Length + 0x15 + Encrypt(pkcs5_pad(counter+1(2)+communication_id(6)+
+//           SF1(1)+SF2(1)+blk_cnt(1)+blk_data)+MAC(8))
 // No IDm in either direction. Service code index refers to Auth1 service codes.
 // ---------------------------------------------------------------------------
 static FelicaError felica_listener_command_handler_secure_read(
@@ -1090,62 +1017,102 @@ static FelicaError felica_listener_command_handler_secure_read(
     uint8_t iv[8] = {0};
     felica_std_des_cbc_decrypt(instance->r2, iv, enc_payload, decrypted, enc_len);
 
-    // Minimum: counter(2)+R1(8)+blk_cnt(1)+[null_pad]+MAC(8) = at least 24 bytes encrypted
+    // Minimum: counter(2)+communication ID(6)+blk_cnt(1)+block list(2)+padding+MAC(8)
+    // occupies at least three DES blocks.
     if(enc_len < 24) return FelicaErrorProtocol;
+    felica_listener_log_hex("Read decrypted", decrypted, enc_len);
     uint16_t counter = (uint16_t)(decrypted[0] | ((uint16_t)decrypted[1] << 8));
-    if(counter <= instance->des_comm_counter) return FelicaErrorProtocol;
-    if(memcmp(decrypted + 2, instance->r1, 8) != 0) return FelicaErrorProtocol;
+    if(!felica_std_check_command_counter(instance, counter)) {
+        FURI_LOG_E(
+            TAG,
+            "Read counter mismatch: got %u, expected %u",
+            counter,
+            instance->des_comm_counter + 1);
+        return FelicaErrorProtocol;
+    }
+    if(!felica_std_check_secure_communication_id(instance, decrypted + 2)) {
+        felica_listener_log_hex(
+            "Read comm_id (got)", decrypted + 2, FELICA_STANDARD_COMMUNICATION_ID_SIZE);
+        felica_listener_log_hex(
+            "Read comm_id (expected, R1[2:7])",
+            instance->r1 + FELICA_STANDARD_SECURE_COMMUNICATION_ID_OFFSET,
+            FELICA_STANDARD_COMMUNICATION_ID_SIZE);
+        return FelicaErrorProtocol;
+    }
 
-    // MAC covers all bytes except last 8 (null_pad is included in MAC-covered data)
+    // MAC covers all bytes except last 8 (padding is included in MAC-covered data)
     uint8_t expected_mac[8];
     size_t mac_data_len = enc_len - 8;
     felica_std_compute_mac(pkt_len, FELICA_CMD_READ, decrypted, mac_data_len, expected_mac);
-    if(memcmp(expected_mac, decrypted + mac_data_len, 8) != 0) return FelicaErrorProtocol;
+    if(memcmp(expected_mac, decrypted + mac_data_len, 8) != 0) {
+        felica_listener_log_hex("Read MAC (got)", decrypted + mac_data_len, 8);
+        felica_listener_log_hex("Read MAC (expected)", expected_mac, 8);
+        return FelicaErrorProtocol;
+    }
 
-    instance->des_comm_counter = counter;
+    // Parse block list after counter(2) + communication ID(6) + block count(1).
+    const size_t block_count_offset = 2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE;
+    const uint8_t blk_cnt = decrypted[block_count_offset];
+    FelicaStandardSecureBlockListElement block_list[FELICA_STANDARD_SECURE_READ_BLOCK_MAX];
+    size_t block_list_size = 0;
+    if(!felica_std_parse_secure_block_list(
+           decrypted + block_count_offset + 1,
+           mac_data_len - (block_count_offset + 1),
+           blk_cnt,
+           block_list,
+           COUNT_OF(block_list),
+           &block_list_size)) {
+        return FelicaErrorProtocol;
+    }
 
-    // Parse block list: offset 10 = past counter(2)+R1(8)
-    uint8_t inner_off = 10;
-    uint8_t blk_cnt = decrypted[inner_off++];
-    if(blk_cnt > FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX)
-        blk_cnt = FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX;
+    const size_t unpadded_len = block_count_offset + 1 + block_list_size;
+    if(!felica_std_check_request_padding(decrypted, mac_data_len, unpadded_len))
+        return FelicaErrorProtocol;
 
     const FelicaSystem* system = NULL;
-    if(simple_array_get_count(instance->data->systems) > 0)
+    if(instance->auth_system_idx < simple_array_get_count(instance->data->systems)) {
         system = simple_array_cget(instance->data->systems, instance->auth_system_idx);
+    }
 
     uint8_t sf1 = 0, sf2 = 0;
-    uint8_t block_data[FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX][FELICA_DATA_BLOCK_SIZE];
+    uint8_t block_data[FELICA_STANDARD_SECURE_READ_BLOCK_MAX][FELICA_DATA_BLOCK_SIZE];
     uint8_t actual_cnt = 0;
 
     for(uint8_t i = 0; i < blk_cnt; i++) {
-        uint8_t svc_idx = decrypted[inner_off] & 0x0F;
-        bool is_2byte = (decrypted[inner_off] >> 7) != 0;
-        uint8_t blk_num;
-        if(is_2byte) {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 2;
-        } else {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 3;
-        }
+        const uint8_t svc_idx = block_list[i].service_index;
+        const uint16_t blk_num = block_list[i].block_number;
         if(svc_idx >= instance->auth_service_count || !system) {
             sf1 = 0xFF;
             sf2 = 0xA8;
             break;
         }
         uint16_t svc_code = instance->auth_service_codes[svc_idx];
-        bool found = false;
-        uint32_t pb_count = simple_array_get_count(system->public_blocks);
-        for(uint32_t j = 0; j < pb_count; j++) {
-            const FelicaPublicBlock* pb = simple_array_cget(system->public_blocks, j);
-            if(pb->service_code == svc_code && pb->block_idx == blk_num) {
-                memcpy(block_data[actual_cnt], pb->block.data, FELICA_DATA_BLOCK_SIZE);
-                found = true;
-                break;
-            }
+        const FelicaPublicBlock* pb = felica_std_find_public_block(system, svc_code, blk_num);
+        bool found = pb != NULL;
+        if(found) {
+            memcpy(block_data[actual_cnt], pb->block.data, FELICA_DATA_BLOCK_SIZE);
         }
         if(!found) {
+            FURI_LOG_E(
+                TAG,
+                "Secure Read block missing: system=%u service=%04X block=%04X loaded=%lu",
+                instance->auth_system_idx,
+                svc_code,
+                blk_num,
+                simple_array_get_count(system->public_blocks));
+            const uint32_t public_block_count = simple_array_get_count(system->public_blocks);
+            for(uint32_t j = 0; j < public_block_count; j++) {
+                const FelicaPublicBlock* candidate = simple_array_cget(system->public_blocks, j);
+                if((candidate->service_code >> 6) == (svc_code >> 6) &&
+                   candidate->block_idx + 1 >= blk_num && candidate->block_idx <= blk_num + 1) {
+                    FURI_LOG_E(
+                        TAG,
+                        "Secure Read candidate: entry=%lu service=%04X block=%02X",
+                        j,
+                        candidate->service_code,
+                        candidate->block_idx);
+                }
+            }
             sf1 = 0xFF;
             sf2 = 0xA8;
             break;
@@ -1153,18 +1120,28 @@ static FelicaError felica_listener_command_handler_secure_read(
         actual_cnt++;
     }
 
-    // Build response plaintext: counter+1(2)+R1(8)+SF1(1)+SF2(1)+[blk_cnt(1)+blk_data]
+    // Build response plaintext: counter+1(2)+communication ID(6)+SF1(1)+SF2(1)+
+    // block count(1)+block data. The block count is present even for an error response.
     uint16_t resp_counter = counter + 1;
-    uint8_t resp_plain[2 + 8 + 1 + 1 + 1 + FELICA_STANDARD_ENCRYPTED_READ_BLOCK_MAX * FELICA_DATA_BLOCK_SIZE];
+    // The counter increments on every exchange - both request and response - as replay
+    // protection, not just per request. Track resp_counter so the next expected request
+    // is counter+2, not counter+1.
+    instance->des_comm_counter = resp_counter;
+    uint8_t resp_plain
+        [2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE + 1 + 1 + 1 +
+         FELICA_STANDARD_SECURE_READ_BLOCK_MAX * FELICA_DATA_BLOCK_SIZE];
     size_t resp_plain_len = 0;
     resp_plain[resp_plain_len++] = (uint8_t)(resp_counter & 0xFF);
     resp_plain[resp_plain_len++] = (uint8_t)(resp_counter >> 8);
-    memcpy(resp_plain + resp_plain_len, instance->r1, 8);
-    resp_plain_len += 8;
+    memcpy(
+        resp_plain + resp_plain_len,
+        instance->r1 + FELICA_STANDARD_SECURE_COMMUNICATION_ID_OFFSET,
+        FELICA_STANDARD_COMMUNICATION_ID_SIZE);
+    resp_plain_len += FELICA_STANDARD_COMMUNICATION_ID_SIZE;
     resp_plain[resp_plain_len++] = sf1;
     resp_plain[resp_plain_len++] = sf2;
+    resp_plain[resp_plain_len++] = (sf1 == 0) ? actual_cnt : 0;
     if(sf1 == 0) {
-        resp_plain[resp_plain_len++] = actual_cnt;
         for(uint8_t i = 0; i < actual_cnt; i++) {
             memcpy(resp_plain + resp_plain_len, block_data[i], FELICA_DATA_BLOCK_SIZE);
             resp_plain_len += FELICA_DATA_BLOCK_SIZE;
@@ -1177,7 +1154,8 @@ static FelicaError felica_listener_command_handler_secure_read(
     // final_pkt_len = 1(len)+1(code)+padded_data_len+8(MAC)  [no IDm]
     uint8_t final_pkt_len = (uint8_t)(1 + 1 + padded_data_len + 8);
     uint8_t resp_mac[8];
-    felica_std_compute_mac(final_pkt_len, FELICA_CMD_READ_RESP, padded_data, padded_data_len, resp_mac);
+    felica_std_compute_mac(
+        final_pkt_len, FELICA_CMD_READ_RESP, padded_data, padded_data_len, resp_mac);
 
     uint8_t full[sizeof(padded_data) + 8];
     memcpy(full, padded_data, padded_data_len);
@@ -1187,7 +1165,7 @@ static FelicaError felica_listener_command_handler_secure_read(
     memset(iv, 0, 8);
     felica_std_des_cbc_encrypt(instance->r2, iv, full, enc_resp, full_len);
 
-    uint8_t resp_buf[128];
+    uint8_t resp_buf[2 + sizeof(enc_resp)];
     resp_buf[0] = final_pkt_len;
     resp_buf[1] = FELICA_CMD_READ_RESP;
     memcpy(resp_buf + 2, enc_resp, full_len);
@@ -1199,8 +1177,10 @@ static FelicaError felica_listener_command_handler_secure_read(
 
 // ---------------------------------------------------------------------------
 // Secure Write handler (command 0x16)
-// Request:  Length + 0x16 + Encrypt(null_pad(counter(2)+R1(8)+blk_cnt(1)+blk_list+blk_data(16n))+MAC(8))
-// Response: Length + 0x17 + Encrypt(pkcs5_pad(counter+1(2)+R1(8)+SF1(1)+SF2(1))+MAC(8))
+// Request:  Length + 0x16 + Encrypt(pad(counter(2)+communication_id(6)+
+//           blk_cnt(1)+blk_list+blk_data(16n))+MAC(8))
+// Response: Length + 0x17 + Encrypt(pkcs5_pad(counter+1(2)+communication_id(6)+
+//           SF1(1)+SF2(1))+MAC(8))
 // No IDm in either direction. Service code index refers to Auth1 service codes.
 // ---------------------------------------------------------------------------
 static FelicaError felica_listener_command_handler_secure_write(
@@ -1215,15 +1195,16 @@ static FelicaError felica_listener_command_handler_secure_write(
     if(enc_len == 0 || enc_len % 8 != 0) return FelicaErrorProtocol;
 
     const uint8_t* enc_payload = raw + 2;
-    uint8_t decrypted[128];
+    uint8_t decrypted[192];
     if(enc_len > sizeof(decrypted)) return FelicaErrorProtocol;
     uint8_t iv[8] = {0};
     felica_std_des_cbc_decrypt(instance->r2, iv, enc_payload, decrypted, enc_len);
 
     if(enc_len < 24) return FelicaErrorProtocol;
     uint16_t counter = (uint16_t)(decrypted[0] | ((uint16_t)decrypted[1] << 8));
-    if(counter <= instance->des_comm_counter) return FelicaErrorProtocol;
-    if(memcmp(decrypted + 2, instance->r1, 8) != 0) return FelicaErrorProtocol;
+    if(!felica_std_check_command_counter(instance, counter)) return FelicaErrorProtocol;
+    if(!felica_std_check_secure_communication_id(instance, decrypted + 2))
+        return FelicaErrorProtocol;
 
     // MAC covers all bytes except last 8
     uint8_t expected_mac[8];
@@ -1231,46 +1212,62 @@ static FelicaError felica_listener_command_handler_secure_write(
     felica_std_compute_mac(pkt_len, FELICA_CMD_WRITE, decrypted, mac_data_len, expected_mac);
     if(memcmp(expected_mac, decrypted + mac_data_len, 8) != 0) return FelicaErrorProtocol;
 
-    instance->des_comm_counter = counter;
+    // Parse block list after counter(2) + communication ID(6) + block count(1).
+    const size_t block_count_offset = 2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE;
+    const uint8_t blk_cnt = decrypted[block_count_offset];
+    FelicaStandardSecureBlockListElement block_list[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
+    size_t block_list_size = 0;
+    if(!felica_std_parse_secure_block_list(
+           decrypted + block_count_offset + 1,
+           mac_data_len - (block_count_offset + 1),
+           blk_cnt,
+           block_list,
+           COUNT_OF(block_list),
+           &block_list_size)) {
+        return FelicaErrorProtocol;
+    }
 
-    // Parse block list: offset 10 = past counter(2)+R1(8)
-    uint8_t inner_off = 10;
-    uint8_t blk_cnt = decrypted[inner_off++];
-    if(blk_cnt > 8) blk_cnt = 8;
+    const size_t block_data_offset = block_count_offset + 1 + block_list_size;
+    const size_t block_data_size = (size_t)blk_cnt * FELICA_DATA_BLOCK_SIZE;
+    if((block_data_offset > mac_data_len) ||
+       (block_data_size > mac_data_len - block_data_offset)) {
+        return FelicaErrorProtocol;
+    }
+    const size_t unpadded_len = block_data_offset + block_data_size;
+    if(!felica_std_check_request_padding(decrypted, mac_data_len, unpadded_len))
+        return FelicaErrorProtocol;
 
     struct {
         uint16_t svc_code;
-        uint8_t blk_num;
-    } targets[8];
+        uint16_t blk_num;
+        FelicaPublicBlock* block;
+    } targets[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
     uint8_t valid_cnt = 0;
     uint8_t sf1 = 0, sf2 = 0;
 
     for(uint8_t i = 0; i < blk_cnt; i++) {
-        uint8_t svc_idx = decrypted[inner_off] & 0x0F;
-        bool is_2byte = (decrypted[inner_off] >> 7) != 0;
-        uint8_t blk_num;
-        if(is_2byte) {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 2;
-        } else {
-            blk_num = decrypted[inner_off + 1];
-            inner_off += 3;
-        }
+        const uint8_t svc_idx = block_list[i].service_index;
         if(svc_idx >= instance->auth_service_count) {
             sf1 = 0xFF;
             sf2 = 0xA8;
             break;
         }
         targets[valid_cnt].svc_code = instance->auth_service_codes[svc_idx];
-        targets[valid_cnt].blk_num = blk_num;
+        targets[valid_cnt].blk_num = block_list[i].block_number;
+        targets[valid_cnt].block = NULL;
         valid_cnt++;
     }
 
-    // Write block data if no error yet
-    const FelicaSystem* system = NULL;
-    if(simple_array_get_count(instance->data->systems) > 0)
-        system = simple_array_cget(instance->data->systems, instance->auth_system_idx);
+    FelicaSystem* system = NULL;
+    if(instance->auth_system_idx < simple_array_get_count(instance->data->systems)) {
+        system = simple_array_get(instance->data->systems, instance->auth_system_idx);
+    }
+    if(sf1 == 0 && !system) {
+        sf1 = 0xFF;
+        sf2 = 0xA8;
+    }
 
+    // Validate every target before changing any block, so a failed multi-block write is atomic.
     if(sf1 == 0 && system) {
         for(uint8_t i = 0; i < valid_cnt; i++) {
             // Check service is writable
@@ -1288,18 +1285,11 @@ static FelicaError felica_listener_command_handler_secure_write(
                 sf2 = 0xA6;
                 break;
             }
-            bool found = false;
-            uint32_t pb_count = simple_array_get_count(system->public_blocks);
-            for(uint32_t j = 0; j < pb_count; j++) {
-                FelicaPublicBlock* pb = simple_array_get(system->public_blocks, j);
-                if(pb->service_code == targets[i].svc_code && pb->block_idx == targets[i].blk_num) {
-                    memcpy(
-                        pb->block.data,
-                        decrypted + inner_off + i * FELICA_DATA_BLOCK_SIZE,
-                        FELICA_DATA_BLOCK_SIZE);
-                    found = true;
-                    break;
-                }
+            FelicaPublicBlock* pb =
+                felica_std_find_public_block_mut(system, targets[i].svc_code, targets[i].blk_num);
+            bool found = pb != NULL;
+            if(found) {
+                targets[i].block = pb;
             }
             if(!found) {
                 sf1 = 0xFF;
@@ -1309,18 +1299,34 @@ static FelicaError felica_listener_command_handler_secure_write(
         }
     }
 
-    // Build response: counter+1(2)+R1(8)+SF1(1)+SF2(1) = 12 bytes
+    if(sf1 == 0) {
+        for(uint8_t i = 0; i < valid_cnt; i++) {
+            memcpy(
+                targets[i].block->block.data,
+                decrypted + block_data_offset + i * FELICA_DATA_BLOCK_SIZE,
+                FELICA_DATA_BLOCK_SIZE);
+        }
+    }
+
+    // Build response: counter+1(2)+communication ID(6)+SF1(1)+SF2(1) = 10 bytes
     uint16_t resp_counter = counter + 1;
-    uint8_t resp_plain[12];
+    // The counter increments on every exchange - both request and response - as replay
+    // protection, not just per request. Track resp_counter so the next expected request
+    // is counter+2, not counter+1.
+    instance->des_comm_counter = resp_counter;
+    uint8_t resp_plain[2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE + 2];
     resp_plain[0] = (uint8_t)(resp_counter & 0xFF);
     resp_plain[1] = (uint8_t)(resp_counter >> 8);
-    memcpy(resp_plain + 2, instance->r1, 8);
-    resp_plain[10] = sf1;
-    resp_plain[11] = sf2;
+    memcpy(
+        resp_plain + 2,
+        instance->r1 + FELICA_STANDARD_SECURE_COMMUNICATION_ID_OFFSET,
+        FELICA_STANDARD_COMMUNICATION_ID_SIZE);
+    resp_plain[8] = sf1;
+    resp_plain[9] = sf2;
 
-    // PKCS#5 pad data(12→16), compute MAC over padded, append MAC
+    // PKCS#5 pad the response data, compute its MAC, append the MAC, then encrypt all of it.
     uint8_t padded_data[16 + 8];
-    size_t padded_data_len = felica_std_pkcs5_pad(resp_plain, 12, padded_data);
+    size_t padded_data_len = felica_std_pkcs5_pad(resp_plain, sizeof(resp_plain), padded_data);
     // final_pkt_len = 1(len)+1(code)+padded_data_len+8(MAC)  [no IDm]
     uint8_t final_pkt_len = (uint8_t)(1 + 1 + padded_data_len + 8);
     uint8_t resp_mac[8];
@@ -1378,16 +1384,6 @@ static FelicaError felica_listener_process_request(
             return felica_listener_command_handler_auth2(instance, generic_request);
         }
         return FelicaErrorNotPresent;
-    case FELICA_CMD_READ_ENCRYPTED:
-        if(instance->data->workflow_type == FelicaStandard) {
-            return felica_listener_command_handler_encrypted_read(instance, generic_request);
-        }
-        return FelicaErrorNotPresent;
-    case FELICA_CMD_WRITE_ENCRYPTED:
-        if(instance->data->workflow_type == FelicaStandard) {
-            return felica_listener_command_handler_encrypted_write(instance, generic_request);
-        }
-        return FelicaErrorNotPresent;
     case FELICA_CMD_READ:
         if(instance->data->workflow_type == FelicaStandard) {
             return felica_listener_command_handler_secure_read(instance, generic_request);
@@ -1419,6 +1415,20 @@ static bool felica_listener_check_system_code(
         generic_request->polling.system_code == code ||
         generic_request->polling.system_code == (code | 0x00FFU) ||
         generic_request->polling.system_code == (code | 0xFF00U));
+}
+
+static bool felica_listener_polling_targets_current_system(
+    const FelicaListener* instance,
+    const FelicaListenerGenericRequest* generic_request) {
+    // The wildcard Polling includes the currently selected System, so it must not
+    // terminate Mode 3 or produce another response during the authenticated session.
+    if(generic_request->polling.system_code == FELICA_SYSTEM_CODE_CODE) return true;
+
+    const FelicaSystem* current_system = felica_listener_get_current_system(instance);
+    if(!current_system) return false;
+
+    const uint16_t current_wire_code = __builtin_bswap16(current_system->system_code);
+    return felica_listener_check_system_code(generic_request, current_wire_code);
 }
 
 // Returns the matched System's wire-format code, or FELICA_SYSTEM_CODE_CODE if none
@@ -1526,7 +1536,33 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
                 break;
             }
 
-            if(request->header.code == FELICA_LISTENER_CMD_POLLING) {
+            if(request->header.code == FELICA_CMD_POLLING) {
+                if(instance->mode == FELICA_LISTENER_MODE_AUTHENTICATED) {
+                    if(felica_listener_polling_targets_current_system(instance, request)) {
+                        FURI_LOG_D(TAG, "Current System Polling ignored in Mode 3");
+                        // No response is transmitted in Mode 3, so explicitly restart
+                        // reception for the command that follows this Polling frame.
+                        command = NfcCommandReset;
+                        break;
+                    }
+
+                    uint8_t target_system_idx = 0;
+                    const uint16_t target_system_code = felica_listener_get_response_system_code(
+                        instance, request, &target_system_idx);
+                    if(target_system_code == FELICA_SYSTEM_CODE_CODE) {
+                        FURI_LOG_D(TAG, "Unknown System Polling ignored in Mode 3");
+                        command = NfcCommandReset;
+                        break;
+                    }
+
+                    FURI_LOG_D(
+                        TAG,
+                        "Switching System by Polling: %u -> %u, Mode 0",
+                        instance->current_system_idx,
+                        target_system_idx);
+                    felica_listener_set_mode(instance, FELICA_LISTENER_MODE_UNAUTHENTICATED);
+                }
+
                 // Will always respond at Time Slot 0 for now.
                 nfc_felica_listener_timer_anticol_start(instance->nfc, 0);
                 if(request->polling.system_code != FELICA_SYSTEM_CODE_CODE) {
@@ -1542,7 +1578,12 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
                     FURI_LOG_E(TAG, "Hardware Polling command leaking through");
                     break;
                 }
-            } else if(!felica_listener_check_idm(instance, &request->header.idm)) {
+            } else if(
+                request->header.code != FELICA_CMD_READ &&
+                request->header.code != FELICA_CMD_WRITE &&
+                request->header.code != FELICA_CMD_AUTHENTICATION1 &&
+                request->header.code != FELICA_CMD_AUTHENTICATION2 &&
+                !felica_listener_check_idm(instance, &request->header.idm)) {
                 FURI_LOG_E(TAG, "Wrong IDm");
                 break;
             }

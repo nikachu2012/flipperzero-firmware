@@ -1,11 +1,15 @@
 #include "felica_listener.h"
 
+#include <nfc/nfc_i.h>
 #include <nfc/protocols/nfc_generic_event.h>
 
 #define FELICA_LISTENER_READ_BLOCK_COUNT_MAX  (4U)
 #define FELICA_LISTENER_READ_BLOCK_COUNT_MIN  (1U)
 #define FELICA_LISTENER_WRITE_BLOCK_COUNT_MAX (2U)
 #define FELICA_LISTENER_WRITE_BLOCK_COUNT_MIN (1U)
+
+#define FELICA_LISTENER_MODE_UNAUTHENTICATED (0U)
+#define FELICA_LISTENER_MODE_AUTHENTICATED   (3U)
 
 #define FELICA_MC_SP_REG_ALL_RW_BYTES_0_1    (0U)
 #define FELICA_MC_ALL_BYTE                   (2U)
@@ -137,6 +141,9 @@ struct FelicaListener {
  * @param      instance  pointer to the listener instance to be used.
  */
 void felica_listener_reset(FelicaListener* instance);
+
+/** Set the card mode and update automatic Polling response behavior. */
+void felica_listener_set_mode(FelicaListener* instance, uint8_t mode);
 
 /** Performs WCNT increasing in case of write operation.
  *

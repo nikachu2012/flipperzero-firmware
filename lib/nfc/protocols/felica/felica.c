@@ -98,6 +98,7 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
     furi_check(data);
 
     bool parsed = false;
+    bool data_valid = true;
     FuriString* str_key_buffer = furi_string_alloc();
     FuriString* str_data_buffer = furi_string_alloc();
 
@@ -387,25 +388,103 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                     break;
                 if(public_block_count == 0) break;
 
+                FURI_LOG_I(
+                    "Felica",
+                    "PBHEX3 loader active: system=%u blocks=%lu",
+                    sys_idx,
+                    public_block_count);
                 simple_array_init(system->public_blocks, public_block_count);
+                memset(
+                    simple_array_get_data(system->public_blocks),
+                    0,
+                    public_block_count * sizeof(FelicaPublicBlock));
                 for(uint16_t i = 0; i < public_block_count; i++) {
                     furi_string_printf(str_key_buffer, "Block %04X", i);
                     if(!flipper_format_read_string(
                            ff, furi_string_get_cstr(str_key_buffer), str_data_buffer)) {
+                        FURI_LOG_E("Felica", "Failed to read public block entry %04X", i);
+                        break;
+                    }
+
+                    char service_code_text[5] = {};
+                    char block_idx_text[3] = {};
+                    if(sscanf(
+                           furi_string_get_cstr(str_data_buffer),
+                           "| Service code %4s | Block index %2s |",
+                           service_code_text,
+                           block_idx_text) != 2) {
+                        FURI_LOG_E(
+                            "Felica",
+                            "Failed to parse public block entry %04X: %s",
+                            i,
+                            furi_string_get_cstr(str_data_buffer));
+                        break;
+                    }
+
+                    // Keep sscanf for extracting the fields, but convert each hex byte
+                    // explicitly. The target libc interprets digit-only values such as
+                    // "13" as decimal even with %X, turning block 13 into block 0D.
+                    uint8_t service_code_hi = 0;
+                    uint8_t service_code_lo = 0;
+                    uint8_t block_idx = 0;
+                    if(!hex_char_to_uint8(
+                           service_code_text[0], service_code_text[1], &service_code_hi) ||
+                       !hex_char_to_uint8(
+                           service_code_text[2], service_code_text[3], &service_code_lo) ||
+                       !hex_char_to_uint8(block_idx_text[0], block_idx_text[1], &block_idx)) {
+                        FURI_LOG_E(
+                            "Felica",
+                            "Failed to parse public block entry %04X: %s",
+                            i,
+                            furi_string_get_cstr(str_data_buffer));
                         break;
                     }
 
                     FelicaPublicBlock* public_block = simple_array_get(system->public_blocks, i);
-                    if(sscanf(
-                           furi_string_get_cstr(str_data_buffer),
-                           "| Service code %04hX | Block index %02hhX |",
-                           &public_block->service_code,
-                           &public_block->block_idx) != 2) {
-                        break;
+                    public_block->service_code = ((uint16_t)service_code_hi << 8) |
+                                                 service_code_lo;
+                    public_block->block_idx = block_idx;
+
+                    // A service cannot contain the same block number more than once.
+                    // Old firmware parsed hexadecimal indices as decimal before writing
+                    // a shadow file, producing duplicates such as 00 for 0A through 0F.
+                    // Reject that shadow so the NFC app can fall back to the original dump.
+                    bool duplicate = false;
+                    for(uint16_t j = 0; j < i; j++) {
+                        const FelicaPublicBlock* previous =
+                            simple_array_cget(system->public_blocks, j);
+                        if((previous->service_code == public_block->service_code) &&
+                           (previous->block_idx == public_block->block_idx)) {
+                            FURI_LOG_E(
+                                "Felica",
+                                "Duplicate public block: entry=%04X previous=%04X service=%04X block=%02X",
+                                i,
+                                j,
+                                public_block->service_code,
+                                public_block->block_idx);
+                            duplicate = true;
+                            data_valid = false;
+                            break;
+                        }
+                    }
+                    if(duplicate) break;
+
+                    // Keep these two boundary entries visible at INFO level while loading.
+                    // They distinguish the fixed hexadecimal parser from the old decimal
+                    // conversion (0E -> 00 and 13 -> 0D) in device logs.
+                    if((sys_idx == 0) && ((i == 0x19) || (i == 0x1E))) {
+                        FURI_LOG_I(
+                            "Felica",
+                            "PBHEX3 load: entry=%04X raw=%s service=%04X block=%02X",
+                            i,
+                            block_idx_text,
+                            public_block->service_code,
+                            public_block->block_idx);
                     }
 
                     size_t needle = furi_string_search_str(str_data_buffer, "Data: ");
                     if(needle == FURI_STRING_FAILURE) {
+                        FURI_LOG_E("Felica", "Missing data in public block entry %04X", i);
                         break;
                     }
                     needle += 6; // length of "Data: " = 6
@@ -413,7 +492,17 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
                     furi_string_replace_all(str_data_buffer, " ", "");
                     if(!hex_chars_to_uint8(
                            furi_string_get_cstr(str_data_buffer), public_block->block.data)) {
+                        FURI_LOG_E("Felica", "Invalid data in public block entry %04X", i);
                         break;
+                    }
+
+                    if(public_block->service_code == 0x090F && public_block->block_idx >= 0x0D) {
+                        FURI_LOG_D(
+                            "Felica",
+                            "Loaded public block entry=%04X service=%04X block=%02X",
+                            i,
+                            public_block->service_code,
+                            public_block->block_idx);
                     }
 
                     furi_string_reset(str_data_buffer);
@@ -432,7 +521,7 @@ bool felica_load(FelicaData* data, FlipperFormat* ff, uint32_t version) {
     furi_string_free(str_key_buffer);
     furi_string_free(str_data_buffer);
 
-    return parsed;
+    return parsed && data_valid;
 }
 
 bool felica_save(const FelicaData* data, FlipperFormat* ff) {
@@ -754,16 +843,41 @@ void felica_des_derive_user_service_key(
     uint8_t result[8];
     memcpy(result, group_key, 8);
 
+    // Each entry in the service-code list is a FeliCa node code. It may reference a
+    // Service (use its service key), an Area (use its area key), or the System itself
+    // via the 0xFFFF wildcard (use the system key). The user service key degenerates
+    // by encrypting the running value with each referenced node's key in order.
     for(uint8_t i = 0; i < o; i++) {
-        uint32_t svc_count = simple_array_get_count(system->services);
-        for(uint32_t j = 0; j < svc_count; j++) {
-            const FelicaService* svc = simple_array_cget(system->services, j);
-            if(svc->code == service_codes[i]) {
-                uint8_t tmp[8];
-                felica_des_ecb_encrypt(svc->key, result, tmp);
-                memcpy(result, tmp, 8);
-                break;
+        const uint16_t code = service_codes[i];
+        const uint8_t* node_key = NULL;
+
+        if(code == 0xFFFF) {
+            node_key = system->system_key;
+        } else {
+            uint32_t svc_count = simple_array_get_count(system->services);
+            for(uint32_t j = 0; j < svc_count; j++) {
+                const FelicaService* svc = simple_array_cget(system->services, j);
+                if(svc->code == code) {
+                    node_key = svc->key;
+                    break;
+                }
             }
+            if(node_key == NULL) {
+                uint32_t area_count = simple_array_get_count(system->areas);
+                for(uint32_t j = 0; j < area_count; j++) {
+                    const FelicaArea* area = simple_array_cget(system->areas, j);
+                    if(area->code == code) {
+                        node_key = area->key;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if(node_key != NULL) {
+            uint8_t tmp[8];
+            felica_des_ecb_encrypt(node_key, result, tmp);
+            memcpy(result, tmp, 8);
         }
     }
     memcpy(user_key_out, result, 8);

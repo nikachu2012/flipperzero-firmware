@@ -194,6 +194,18 @@ FuriHalNfcError furi_hal_nfc_felica_listener_set_sensf_res_data(
     return FuriHalNfcErrorNone;
 }
 
+FuriHalNfcError furi_hal_nfc_felica_listener_set_sensf_res_enabled(bool enabled) {
+    const FuriHalSpiBusHandle* handle = &furi_hal_spi_bus_handle_nfc;
+    if(enabled) {
+        st25r3916_clear_reg_bits(
+            handle, ST25R3916_REG_PASSIVE_TARGET, ST25R3916_REG_PASSIVE_TARGET_d_212_424_1r);
+    } else {
+        st25r3916_set_reg_bits(
+            handle, ST25R3916_REG_PASSIVE_TARGET, ST25R3916_REG_PASSIVE_TARGET_d_212_424_1r);
+    }
+    return FuriHalNfcErrorNone;
+}
+
 const FuriHalNfcTechBase furi_hal_nfc_felica = {
     .poller =
         {

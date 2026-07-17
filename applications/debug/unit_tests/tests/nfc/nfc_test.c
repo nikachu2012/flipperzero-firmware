@@ -4,6 +4,7 @@
 
 #include <nfc/nfc_device.h>
 #include <nfc/helpers/nfc_data_generator.h>
+#include <nfc/helpers/felica_crc.h>
 #include <nfc/nfc_poller.h>
 #include <nfc/nfc_listener.h>
 #include <nfc/protocols/iso14443_3a/iso14443_3a.h>
@@ -13,6 +14,8 @@
 #include <nfc/protocols/mf_ultralight/mf_ultralight_poller_sync.h>
 #include <nfc/protocols/mf_classic/mf_classic_poller_sync.h>
 #include <nfc/protocols/felica/felica.h>
+#include <nfc/protocols/felica/felica_listener_defs.h>
+#include <nfc/protocols/felica/felica_listener_i.h>
 #include <nfc/protocols/felica/felica_poller_sync.h>
 #include <nfc/protocols/mf_classic/mf_classic_poller.h>
 #include <nfc/protocols/iso15693_3/iso15693_3_poller.h>
@@ -740,6 +743,83 @@ MU_TEST(felica_standard_read) {
     felica_free(felica_data);
 }
 
+MU_TEST(felica_standard_hex_block_index_load) {
+    NfcDevice* nfc_device = nfc_device_alloc();
+    mu_assert(
+        nfc_device_load(nfc_device, EXT_PATH("unit_tests/nfc/Felica_Standard_hex_block_index.nfc")),
+        "nfc_device_load() failed");
+
+    const FelicaData* felica_data = nfc_device_get_data(nfc_device, NfcProtocolFelica);
+    const FelicaSystem* system = simple_array_cget(felica_data->systems, 0);
+    mu_assert(simple_array_get_count(system->public_blocks) == 31, "public block count != 31");
+    const FelicaPublicBlock* block_0a = simple_array_cget(system->public_blocks, 21);
+    mu_assert(block_0a->service_code == 0x090F, "block[0A] service_code != 0x090F");
+    mu_assert(block_0a->block_idx == 0x0A, "block[0A] block_idx != 0x0A");
+    for(size_t i = 0; i < FELICA_DATA_BLOCK_SIZE; i++) {
+        mu_assert(block_0a->block.data[i] == 0x0A, "block[0A] data mismatch");
+    }
+
+    const FelicaPublicBlock* block_0e = simple_array_cget(system->public_blocks, 25);
+    mu_assert(block_0e->block_idx == 0x0E, "block[0E] block_idx != 0x0E");
+    const FelicaPublicBlock* block_13 = simple_array_cget(system->public_blocks, 30);
+    mu_assert(block_13->block_idx == 0x13, "block[13] block_idx != 0x13");
+
+    nfc_device_free(nfc_device);
+}
+
+MU_TEST(felica_standard_duplicate_block_rejected) {
+    NfcDevice* nfc_device = nfc_device_alloc();
+    mu_assert(
+        !nfc_device_load(
+            nfc_device, EXT_PATH("unit_tests/nfc/Felica_Standard_duplicate_block.nfc")),
+        "duplicate public block was accepted");
+    nfc_device_free(nfc_device);
+}
+
+MU_TEST(felica_mode3_polling_suppressed_until_field_off) {
+    Nfc* nfc = nfc_alloc();
+    FelicaData* data = felica_alloc();
+    felica_reset(data);
+
+    FelicaListener listener = {
+        .nfc = nfc,
+        .data = data,
+        .des_auth_state = 2,
+    };
+    felica_listener_set_mode(&listener, FELICA_LISTENER_MODE_AUTHENTICATED);
+
+    const uint8_t polling[] = {6, FELICA_CMD_POLLING, 0xFF, 0xFF, 0, 0};
+    BitBuffer* rx_buffer = bit_buffer_alloc(16);
+    bit_buffer_append_bytes(rx_buffer, polling, sizeof(polling));
+    felica_crc_append(rx_buffer);
+
+    NfcEvent nfc_event = {
+        .type = NfcEventTypeRxEnd,
+        .data.buffer = rx_buffer,
+    };
+    NfcGenericEvent generic_event = {
+        .protocol = NfcProtocolInvalid,
+        .event_data = &nfc_event,
+    };
+    mu_assert(
+        nfc_listener_felica.run(generic_event, &listener) == NfcCommandReset,
+        "Mode 3 Polling returned an unexpected command");
+    mu_assert(bit_buffer_get_size(rx_buffer) == 0, "Mode 3 Polling was not consumed");
+    mu_assert(
+        listener.mode == FELICA_LISTENER_MODE_AUTHENTICATED,
+        "Mode changed while suppressing Polling");
+
+    nfc_event.type = NfcEventTypeFieldOff;
+    nfc_listener_felica.run(generic_event, &listener);
+    mu_assert(
+        listener.mode == FELICA_LISTENER_MODE_UNAUTHENTICATED, "Field Off did not restore Mode 0");
+    mu_assert(listener.des_auth_state == 0, "Field Off did not clear authentication state");
+
+    bit_buffer_free(rx_buffer);
+    felica_free(data);
+    nfc_free(nfc);
+}
+
 MU_TEST(felica_read_auth) {
     FelicaData* felica_data = felica_alloc();
     FelicaCardKey card_key;
@@ -918,6 +998,9 @@ MU_TEST_SUITE(nfc) {
     MU_RUN_TEST(felica_read);
     MU_RUN_TEST(felica_read_auth);
     MU_RUN_TEST(felica_standard_read);
+    MU_RUN_TEST(felica_standard_hex_block_index_load);
+    MU_RUN_TEST(felica_standard_duplicate_block_rejected);
+    MU_RUN_TEST(felica_mode3_polling_suppressed_until_field_off);
 
     MU_RUN_TEST(slix_file_with_capabilities_test);
     MU_RUN_TEST(slix_set_password_default_cap_correct_pass);

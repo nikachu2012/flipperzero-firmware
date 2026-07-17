@@ -13,6 +13,7 @@ extern "C" {
 #define FELICA_PMM_SIZE        (8U)
 #define FELICA_DATA_BLOCK_SIZE (16U)
 
+#define FELICA_CMD_POLLING                  (0x00U)
 #define FELICA_CMD_READ_WITHOUT_ENCRYPTION  (0x06U)
 #define FELICA_CMD_WRITE_WITHOUT_ENCRYPTION (0x08U)
 
@@ -66,10 +67,6 @@ extern "C" {
 #define FELICA_CMD_READ_RESP                0x15
 #define FELICA_CMD_WRITE                    0x16
 #define FELICA_CMD_WRITE_RESP               0x17
-#define FELICA_CMD_READ_ENCRYPTED           0x30
-#define FELICA_CMD_READ_ENCRYPTED_RESP      0x31
-#define FELICA_CMD_WRITE_ENCRYPTED          0x32
-#define FELICA_CMD_WRITE_ENCRYPTED_RESP     0x33
 
 #define FELICA_SERVICE_ATTRIBUTE_UNAUTH_READ    (0b000001)
 #define FELICA_SERVICE_ATTRIBUTE_READ_ONLY      (0b000010)

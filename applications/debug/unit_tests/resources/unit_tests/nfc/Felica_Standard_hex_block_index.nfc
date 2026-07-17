@@ -1,0 +1,51 @@
+Filetype: Flipper NFC device
+Version: 4
+Device type: FeliCa
+UID: 01 10 0A 10 EB 21 7D 08
+Data format version: 2
+Manufacture id: 01 10 0A 10 EB 21 7D 08
+Manufacture parameter: 05 31 43 45 46 82 B7 FF
+IC Type: FeliCa Standard RC-S104, hexadecimal block index
+
+System found: 1
+
+System 00: 0003 | Key version 0003 |
+
+Area found: 1
+Area 000: | Code 0000 | End FFFE | Services #000-#000 | Key version 0003 |
+
+Service found: 1
+Service 000: | Code 090F | Attrib. 0F | Public  | Cyclic | Read Only  | Key version 0003 |
+
+Public blocks read: 31
+Block 0000: | Service code 004A | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0001: | Service code 004A | Block index 01 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0002: | Service code 004A | Block index 02 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0003: | Service code 004A | Block index 03 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0004: | Service code 008B | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0005: | Service code 0816 | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0006: | Service code 0856 | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0007: | Service code 0896 | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0008: | Service code 08CA | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0009: | Service code 08CA | Block index 01 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000A: | Service code 08CA | Block index 02 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000B: | Service code 090F | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000C: | Service code 090F | Block index 01 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000D: | Service code 090F | Block index 02 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000E: | Service code 090F | Block index 03 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 000F: | Service code 090F | Block index 04 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0010: | Service code 090F | Block index 05 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0011: | Service code 090F | Block index 06 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0012: | Service code 090F | Block index 07 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0013: | Service code 090F | Block index 08 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0014: | Service code 090F | Block index 09 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0015: | Service code 090F | Block index 0A | Data: 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A 0A |
+Block 0016: | Service code 090F | Block index 0B | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0017: | Service code 090F | Block index 0C | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0018: | Service code 090F | Block index 0D | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0019: | Service code 090F | Block index 0E | Data: 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E 0E |
+Block 001A: | Service code 090F | Block index 0F | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 001B: | Service code 090F | Block index 10 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 001C: | Service code 090F | Block index 11 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 001D: | Service code 090F | Block index 12 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 001E: | Service code 090F | Block index 13 | Data: 13 13 13 13 13 13 13 13 13 13 13 13 13 13 13 13 |

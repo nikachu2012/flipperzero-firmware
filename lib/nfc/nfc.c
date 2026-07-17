@@ -1,8 +1,9 @@
 #ifndef FW_CFG_unit_tests
 
-#include "nfc.h"
+#include "nfc_i.h"
 
 #include <furi_hal_nfc.h>
+#include <furi_hal_nfc_i.h>
 #include <furi/furi.h>
 
 #define TAG "Nfc"
@@ -661,6 +662,13 @@ NfcError nfc_felica_listener_set_sensf_res_data(
     FuriHalNfcError error =
         furi_hal_nfc_felica_listener_set_sensf_res_data(idm, idm_len, pmm, pmm_len, sys_code);
     instance->comm_state = NfcCommStateIdle;
+    return nfc_process_hal_error(error);
+}
+
+NfcError nfc_felica_listener_set_sensf_res_enabled(Nfc* instance, bool enabled) {
+    furi_check(instance);
+
+    FuriHalNfcError error = furi_hal_nfc_felica_listener_set_sensf_res_enabled(enabled);
     return nfc_process_hal_error(error);
 }
 

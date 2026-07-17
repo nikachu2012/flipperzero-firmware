@@ -180,7 +180,8 @@ bool felica_listener_check_block_list_size(
     furi_assert(instance);
     furi_assert(req);
 
-    if(req->header.code == FELICA_CMD_REQUEST_SYSTEM_CODE ||
+    if(req->header.code == FELICA_CMD_POLLING ||
+       req->header.code == FELICA_CMD_REQUEST_SYSTEM_CODE ||
        req->header.code == FELICA_CMD_LIST_SERVICE_CODE ||
        req->header.code == FELICA_CMD_REQUEST_SERVICE ||
        req->header.code == FELICA_CMD_REQUEST_RESPONSE) {
@@ -193,8 +194,6 @@ bool felica_listener_check_block_list_size(
         req->header.code == FELICA_CMD_WRITE_WITHOUT_ENCRYPTION ||
         req->header.code == FELICA_CMD_AUTHENTICATION1 ||
         req->header.code == FELICA_CMD_AUTHENTICATION2 ||
-        req->header.code == FELICA_CMD_READ_ENCRYPTED ||
-        req->header.code == FELICA_CMD_WRITE_ENCRYPTED ||
         req->header.code == FELICA_CMD_READ ||
         req->header.code == FELICA_CMD_WRITE)) {
         return true;
@@ -241,6 +240,14 @@ bool felica_listener_check_idm(const FelicaListener* instance, const FelicaIDm* 
     return memcmp(idm.data, request_idm->data, 8) == 0;
 }
 
+void felica_listener_set_mode(FelicaListener* instance, uint8_t mode) {
+    furi_assert(instance);
+
+    instance->mode = mode;
+    nfc_felica_listener_set_sensf_res_enabled(
+        instance->nfc, mode != FELICA_LISTENER_MODE_AUTHENTICATED);
+}
+
 void felica_listener_reset(FelicaListener* instance) {
     furi_assert(instance);
 
@@ -248,7 +255,7 @@ void felica_listener_reset(FelicaListener* instance) {
     instance->auth.context.auth_status.external = false;
     instance->data->data.fs.state.data[0] = 0;
     instance->rc_written = false;
-    instance->mode = 0;
+    felica_listener_set_mode(instance, FELICA_LISTENER_MODE_UNAUTHENTICATED);
     instance->current_system_idx = 0;
     memset(instance->auth.session_key.data, 0, FELICA_DATA_BLOCK_SIZE);
 
@@ -701,6 +708,9 @@ static void felica_handler_write_state_block(
     bool state = instance->data->data.fs.state.data[0] == 0x01;
     instance->auth.context.auth_status.external = state;
     instance->auth.context.auth_status.internal = state;
+    felica_listener_set_mode(
+        instance,
+        state ? FELICA_LISTENER_MODE_AUTHENTICATED : FELICA_LISTENER_MODE_UNAUTHENTICATED);
 }
 
 static void felica_handler_write_id_block(

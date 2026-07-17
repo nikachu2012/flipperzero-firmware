@@ -1,0 +1,22 @@
+Filetype: Flipper NFC device
+Version: 4
+Device type: FeliCa
+UID: 01 10 0A 10 EB 21 7D 08
+Data format version: 2
+Manufacture id: 01 10 0A 10 EB 21 7D 08
+Manufacture parameter: 05 31 43 45 46 82 B7 FF
+IC Type: FeliCa Standard duplicate public block
+
+System found: 1
+
+System 00: 0003 | Key version 0003 |
+
+Area found: 1
+Area 000: | Code 0000 | End FFFE | Services #000-#000 | Key version 0003 |
+
+Service found: 1
+Service 000: | Code 090F | Attrib. 0F | Public | Cyclic | Read Only | Key version 0003 |
+
+Public blocks read: 2
+Block 0000: | Service code 090F | Block index 00 | Data: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 |
+Block 0001: | Service code 090F | Block index 00 | Data: 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 11 |

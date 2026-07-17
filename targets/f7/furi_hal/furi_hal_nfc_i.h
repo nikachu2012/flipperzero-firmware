@@ -66,6 +66,9 @@ typedef struct {
  */
 extern FuriHalNfc furi_hal_nfc;
 
+/** Enable or disable automatic SENSF_RES transmission in FeliCa listener mode. */
+FuriHalNfcError furi_hal_nfc_felica_listener_set_sensf_res_enabled(bool enabled);
+
 /**
  * @brief Initialise NFC HAL event system.
  */

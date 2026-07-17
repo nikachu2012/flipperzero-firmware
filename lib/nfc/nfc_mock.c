@@ -1,6 +1,6 @@
 #ifdef FW_CFG_unit_tests
 
-#include <lib/nfc/nfc.h>
+#include <lib/nfc/nfc_i.h>
 #include <lib/nfc/helpers/iso14443_crc.h>
 #include <lib/nfc/protocols/iso14443_3a/iso14443_3a.h>
 #include <lib/nfc/protocols/felica/felica.h>
@@ -515,6 +515,14 @@ NfcError nfc_felica_listener_set_sensf_res_data(
     instance->software_col_res_required = true;
     memcpy(instance->pt_memory.sens_res.idm.data, idm, idm_len);
     memcpy(instance->pt_memory.sens_res.pmm.data, pmm, pmm_len);
+    return NfcErrorNone;
+}
+
+NfcError nfc_felica_listener_set_sensf_res_enabled(Nfc* instance, bool enabled) {
+    furi_check(instance);
+
+    instance->software_col_res_required = enabled;
+    if(enabled) instance->col_res_status = Iso14443_3aColResStatusIdle;
     return NfcErrorNone;
 }
 
