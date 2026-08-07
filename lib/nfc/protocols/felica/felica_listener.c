@@ -22,13 +22,23 @@
 
 #define TAG "FelicaListener"
 
+// Hex dumps are only ever consumed at debug level, but formatting one still costs a
+// few hundred microseconds. Bail out before touching the buffer when the log level
+// would discard the line anyway, and use a nibble table instead of one snprintf per
+// byte - a secure Read dump is 64 bytes, which was 64 snprintf calls on the path
+// between receiving a command and answering it.
 static void felica_listener_log_hex(const char* label, const uint8_t* data, size_t len) {
+    // Cheap: formats the line and queues it for the writer thread.
     felica_log_buffer(label, data, len);
 
-    size_t n = len < FELICA_LISTENER_MAX_BUFFER_SIZE ? len : FELICA_LISTENER_MAX_BUFFER_SIZE;
+    if(furi_log_get_level() < FuriLogLevelDebug) return;
+
+    static const char nibble[] = "0123456789ABCDEF";
+    const size_t n = len < FELICA_LISTENER_MAX_BUFFER_SIZE ? len : FELICA_LISTENER_MAX_BUFFER_SIZE;
     char hex[FELICA_LISTENER_MAX_BUFFER_SIZE * 2 + 1];
     for(size_t i = 0; i < n; i++) {
-        snprintf(hex + i * 2, 3, "%02X", data[i]);
+        hex[i * 2] = nibble[data[i] >> 4];
+        hex[i * 2 + 1] = nibble[data[i] & 0x0F];
     }
     hex[n * 2] = '\0';
     FURI_LOG_D(TAG, "%s (%zu): %s", label, len, hex);
