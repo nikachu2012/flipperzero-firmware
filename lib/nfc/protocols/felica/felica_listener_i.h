@@ -120,6 +120,8 @@ struct FelicaListener {
     uint8_t r2[8];
     uint8_t des_user_key[8];
     uint8_t des_group_key[8];
+    // Highest secure-command counter accepted so far; the next request must be
+    // strictly greater than it.
     uint16_t des_comm_counter;
     uint16_t auth_area_codes[16];
     uint8_t auth_area_count;

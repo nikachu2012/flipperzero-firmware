@@ -980,10 +980,11 @@ static bool felica_std_check_secure_communication_id(
 
 static bool
     felica_std_check_command_counter(const FelicaListener* instance, uint16_t command_counter) {
-    // Keep one counter value available for the response. A new authentication is
-    // required once the two-byte counter is exhausted.
-    return instance->des_comm_counter < UINT16_MAX - 1 &&
-           command_counter == instance->des_comm_counter + 1;
+    // Accept any counter that moved forward: readers are allowed to skip values, so
+    // only a repeated or older counter is treated as a replay. One value is kept
+    // available for the response counter, so a new authentication is required once
+    // the two-byte counter is exhausted.
+    return command_counter > instance->des_comm_counter && command_counter < UINT16_MAX;
 }
 
 // ---------------------------------------------------------------------------
@@ -1020,9 +1021,9 @@ static FelicaError felica_listener_command_handler_secure_read(
     if(!felica_std_check_command_counter(instance, counter)) {
         FURI_LOG_E(
             TAG,
-            "Read counter mismatch: got %u, expected %u",
+            "Read counter not advancing: got %u, must be greater than %u",
             counter,
-            instance->des_comm_counter + 1);
+            instance->des_comm_counter);
         return FelicaErrorProtocol;
     }
     if(!felica_std_check_secure_communication_id(instance, decrypted + 2)) {
@@ -1118,10 +1119,10 @@ static FelicaError felica_listener_command_handler_secure_read(
     // Build response plaintext: counter+1(2)+communication ID(6)+SF1(1)+SF2(1)+
     // block count(1)+block data. The block count is present even for an error response.
     uint16_t resp_counter = counter + 1;
-    // The counter increments on every exchange - both request and response - as replay
-    // protection, not just per request. Track resp_counter so the next expected request
-    // is counter+2, not counter+1.
-    instance->des_comm_counter = resp_counter;
+    // Remember the counter the reader actually sent: the next request only has to be
+    // greater than it. Readers disagree on whether the response counter consumes a
+    // value, so this accepts both counter+1 and counter+2 as the next request.
+    instance->des_comm_counter = counter;
     uint8_t resp_plain
         [2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE + 1 + 1 + 1 +
          FELICA_STANDARD_SECURE_READ_BLOCK_MAX * FELICA_DATA_BLOCK_SIZE];
@@ -1305,10 +1306,10 @@ static FelicaError felica_listener_command_handler_secure_write(
 
     // Build response: counter+1(2)+communication ID(6)+SF1(1)+SF2(1) = 10 bytes
     uint16_t resp_counter = counter + 1;
-    // The counter increments on every exchange - both request and response - as replay
-    // protection, not just per request. Track resp_counter so the next expected request
-    // is counter+2, not counter+1.
-    instance->des_comm_counter = resp_counter;
+    // Remember the counter the reader actually sent: the next request only has to be
+    // greater than it. Readers disagree on whether the response counter consumes a
+    // value, so this accepts both counter+1 and counter+2 as the next request.
+    instance->des_comm_counter = counter;
     uint8_t resp_plain[2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE + 2];
     resp_plain[0] = (uint8_t)(resp_counter & 0xFF);
     resp_plain[1] = (uint8_t)(resp_counter >> 8);
