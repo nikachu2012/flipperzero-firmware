@@ -70,13 +70,8 @@ FelicaListener* felica_listener_alloc(Nfc* nfc, FelicaData* data) {
         }
     }
 
-    // PMm bytes 2-6 encode the max response time a reader should allow per command
-    // (Request Service / Request Response / Read / Write / Auth). Cards saved from a
-    // real (hardware-fast) FeliCa IC carry short values here; our software emulation
-    // is slower to respond, so real readers following those short timeouts abandon
-    // the session mid-transaction. Widen them to the max so readers wait long enough.
-    memset(data->pmm.data + 2, 0xFF, FELICA_PMM_SIZE - 2);
-
+    // The PMm is emulated exactly as it was read from the NFC file, including the
+    // response-time bytes 2-7.
     const uint16_t system_code = *(uint16_t*)data->data.fs.sys_c.data;
     nfc_felica_listener_set_sensf_res_data(
         nfc, data->idm.data, sizeof(data->idm), data->pmm.data, sizeof(data->pmm), system_code);
