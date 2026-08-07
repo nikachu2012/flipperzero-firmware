@@ -672,28 +672,60 @@ typedef struct {
     uint8_t picc_key[8];
 } FelicaStandardMutualAuthKeys;
 
-static void felica_std_des2_ede_encrypt(
+// Prepared key schedules for one 2-key EDE direction.
+//
+// Each felica_des_ecb_* call runs a full DES key schedule, which measures about 1.2x
+// the cost of the block operation itself. A single EDE pass uses key1 twice, and
+// Authentication 1 runs three EDE passes over only two distinct key pairs - that is
+// nine schedules where four suffice, trimming roughly a fifth off the Auth1 crypto
+// time. Modest on its own, but it is the only part of that path that was avoidable
+// work rather than unavoidable DES.
+typedef struct {
+    mbedtls_des_context outer; // key1, applied first and last
+    mbedtls_des_context inner; // key2, applied in the middle
+} FelicaStandardEdeKeys;
+
+static void felica_std_ede_keys_init(
+    FelicaStandardEdeKeys* keys,
     const uint8_t* key1,
     const uint8_t* key2,
-    const uint8_t* input,
-    uint8_t* output) {
-    uint8_t tmp1[8];
-    uint8_t tmp2[8];
-    felica_des_ecb_encrypt(key1, input, tmp1);
-    felica_des_ecb_decrypt(key2, tmp1, tmp2);
-    felica_des_ecb_encrypt(key1, tmp2, output);
+    bool encrypt) {
+    mbedtls_des_init(&keys->outer);
+    mbedtls_des_init(&keys->inner);
+    if(encrypt) {
+        mbedtls_des_setkey_enc(&keys->outer, key1);
+        mbedtls_des_setkey_dec(&keys->inner, key2);
+    } else {
+        mbedtls_des_setkey_dec(&keys->outer, key1);
+        mbedtls_des_setkey_enc(&keys->inner, key2);
+    }
 }
 
+static void felica_std_ede_keys_free(FelicaStandardEdeKeys* keys) {
+    mbedtls_des_free(&keys->outer);
+    mbedtls_des_free(&keys->inner);
+}
+
+/** Runs one 2-key EDE pass with already prepared schedules. */
+static void
+    felica_std_ede_apply(const FelicaStandardEdeKeys* keys, const uint8_t* input, uint8_t* output) {
+    uint8_t tmp1[8];
+    uint8_t tmp2[8];
+    mbedtls_des_crypt_ecb((mbedtls_des_context*)&keys->outer, input, tmp1);
+    mbedtls_des_crypt_ecb((mbedtls_des_context*)&keys->inner, tmp1, tmp2);
+    mbedtls_des_crypt_ecb((mbedtls_des_context*)&keys->outer, tmp2, output);
+}
+
+/** One-shot 2-key EDE decrypt, for the single pass in Authentication 2. */
 static void felica_std_des2_ede_decrypt(
     const uint8_t* key1,
     const uint8_t* key2,
     const uint8_t* input,
     uint8_t* output) {
-    uint8_t tmp1[8];
-    uint8_t tmp2[8];
-    felica_des_ecb_decrypt(key1, input, tmp1);
-    felica_des_ecb_encrypt(key2, tmp1, tmp2);
-    felica_des_ecb_decrypt(key1, tmp2, output);
+    FelicaStandardEdeKeys keys;
+    felica_std_ede_keys_init(&keys, key1, key2, false);
+    felica_std_ede_apply(&keys, input, output);
+    felica_std_ede_keys_free(&keys);
 }
 
 static void felica_std_derive_mutual_auth_keys(
@@ -804,22 +836,29 @@ static FelicaError felica_listener_command_handler_auth1(
     felica_std_derive_mutual_auth_keys(group_key, user_key, &current_idm, &mutual_auth_keys);
 
     // Decrypt 1A with 2-key EDE (B, A) to recover R1.
-    felica_std_des2_ede_decrypt(
-        mutual_auth_keys.pcd_key, mutual_auth_keys.group_idm_xor, challenge_1a, instance->r1);
+    FelicaStandardEdeKeys pcd_ede;
+    felica_std_ede_keys_init(
+        &pcd_ede, mutual_auth_keys.pcd_key, mutual_auth_keys.group_idm_xor, false);
+    felica_std_ede_apply(&pcd_ede, challenge_1a, instance->r1);
+    felica_std_ede_keys_free(&pcd_ede);
     felica_listener_log_hex("Auth1 1A (raw)", challenge_1a, 8);
     felica_listener_log_hex("Auth1 R1 (decrypted)", instance->r1, 8);
 
+    // 1B and 2A share the PICC-side key pair (A, C), so its schedules are built once.
+    FelicaStandardEdeKeys picc_ede;
+    felica_std_ede_keys_init(
+        &picc_ede, mutual_auth_keys.group_idm_xor, mutual_auth_keys.picc_key, true);
+
     // Encrypt R1 with 2-key EDE (A, C) → 1B.
     uint8_t challenge_1b[8];
-    felica_std_des2_ede_encrypt(
-        mutual_auth_keys.group_idm_xor, mutual_auth_keys.picc_key, instance->r1, challenge_1b);
+    felica_std_ede_apply(&picc_ede, instance->r1, challenge_1b);
 
     // Generate R2 and encrypt it with the same PICC-side EDE keys → 2A.
     furi_hal_random_fill_buf(instance->r2, 8);
     felica_listener_log_hex("Auth1 R2 (generated)", instance->r2, 8);
     uint8_t challenge_2a[8];
-    felica_std_des2_ede_encrypt(
-        mutual_auth_keys.group_idm_xor, mutual_auth_keys.picc_key, instance->r2, challenge_2a);
+    felica_std_ede_apply(&picc_ede, instance->r2, challenge_2a);
+    felica_std_ede_keys_free(&picc_ede);
 
     instance->des_auth_state = 1;
 
