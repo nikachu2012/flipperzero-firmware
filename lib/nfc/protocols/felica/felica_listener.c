@@ -5,6 +5,7 @@
 #include <nfc/helpers/felica_log.h>
 #include <furi_hal_nfc.h>
 #include <furi_hal_random.h>
+#include <furi_hal_cortex.h>
 
 #define FELICA_LISTENER_MAX_BUFFER_SIZE     (256)
 #define FELICA_LISTENER_RESPONSE_POLLING    (0x01U)
@@ -21,6 +22,17 @@
 #define FELICA_LISTENER_PERFORMANCE_VALUE (__builtin_bswap16(0x0083U))
 
 #define TAG "FelicaListener"
+
+// Cycle-accurate stamp for measuring how long a command takes to answer. Two register
+// reads, so it can stay on the critical path; the reporting happens after transmit.
+static uint32_t felica_listener_cycles_now(void) {
+    return furi_hal_cortex_timer_get(0).start;
+}
+
+static uint32_t felica_listener_elapsed_us(uint32_t start_cycles) {
+    const uint32_t cycles = felica_listener_cycles_now() - start_cycles;
+    return cycles / furi_hal_cortex_instructions_per_microsecond();
+}
 
 // Hex dumps are only ever consumed at debug level, but formatting one still costs a
 // few hundred microseconds. Bail out before touching the buffer when the log level
@@ -779,9 +791,10 @@ static size_t felica_std_pkcs5_pad(const uint8_t* in, size_t len, uint8_t* out) 
 static FelicaError felica_listener_command_handler_auth1(
     FelicaListener* instance,
     const FelicaListenerGenericRequest* const generic_request) {
+    const uint32_t start_cycles = felica_listener_cycles_now();
+
     const uint8_t* raw = (const uint8_t*)generic_request;
     const size_t packet_len = raw[0];
-    felica_listener_log_hex("Auth1 rx", raw, packet_len);
     if(packet_len < 2 + 1 + 1 + 8) return FelicaErrorProtocol;
 
     const FelicaIDm current_idm = felica_listener_get_current_idm(instance);
@@ -841,8 +854,6 @@ static FelicaError felica_listener_command_handler_auth1(
         &pcd_ede, mutual_auth_keys.pcd_key, mutual_auth_keys.group_idm_xor, false);
     felica_std_ede_apply(&pcd_ede, challenge_1a, instance->r1);
     felica_std_ede_keys_free(&pcd_ede);
-    felica_listener_log_hex("Auth1 1A (raw)", challenge_1a, 8);
-    felica_listener_log_hex("Auth1 R1 (decrypted)", instance->r1, 8);
 
     // 1B and 2A share the PICC-side key pair (A, C), so its schedules are built once.
     FelicaStandardEdeKeys picc_ede;
@@ -855,7 +866,6 @@ static FelicaError felica_listener_command_handler_auth1(
 
     // Generate R2 and encrypt it with the same PICC-side EDE keys → 2A.
     furi_hal_random_fill_buf(instance->r2, 8);
-    felica_listener_log_hex("Auth1 R2 (generated)", instance->r2, 8);
     uint8_t challenge_2a[8];
     felica_std_ede_apply(&picc_ede, instance->r2, challenge_2a);
     felica_std_ede_keys_free(&picc_ede);
@@ -874,7 +884,20 @@ static FelicaError felica_listener_command_handler_auth1(
 
     bit_buffer_reset(instance->tx_buffer);
     bit_buffer_append_bytes(instance->tx_buffer, resp, response_len);
-    return felica_listener_frame_exchange(instance, instance->tx_buffer);
+    const FelicaError error = felica_listener_frame_exchange(instance, instance->tx_buffer);
+    const uint32_t elapsed_us = felica_listener_elapsed_us(start_cycles);
+
+    // Everything below runs in the slack after the response is on the wire, where it
+    // no longer counts against the reader's Auth1 timeout. The request buffer is only
+    // reset once this handler returns, so raw/challenge_1a are still valid here.
+    FURI_LOG_D(TAG, "Auth1 answered in %lu us", elapsed_us);
+    felica_log_event("Auth1 answered in %lu us", elapsed_us);
+    felica_listener_log_hex("Auth1 rx", raw, packet_len);
+    felica_listener_log_hex("Auth1 1A (raw)", challenge_1a, 8);
+    felica_listener_log_hex("Auth1 R1 (decrypted)", instance->r1, 8);
+    felica_listener_log_hex("Auth1 R2 (generated)", instance->r2, 8);
+
+    return error;
 }
 
 // ---------------------------------------------------------------------------
