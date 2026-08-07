@@ -118,6 +118,9 @@ struct FelicaListener {
     uint8_t des_auth_state; // 0=none, 1=auth1 done, 2=auth2 done
     uint8_t r1[8];
     uint8_t r2[8];
+    // R2 for the next Authentication 1, drawn from the hardware RNG outside the
+    // command/response window. See felica_listener_refill_r2().
+    uint8_t r2_next[8];
     uint8_t des_user_key[8];
     uint8_t des_group_key[8];
     // Highest secure-command counter accepted so far; the next request must be
@@ -146,6 +149,16 @@ void felica_listener_reset(FelicaListener* instance);
 
 /** Set the card mode and update automatic Polling response behavior. */
 void felica_listener_set_mode(FelicaListener* instance, uint8_t mode);
+
+/** Draws the R2 nonce used by the next Authentication 1 from the hardware RNG.
+ *
+ * Must never be called while a command is being answered: the RNG sits behind a
+ * hardware semaphore shared with the radio core, so acquiring it can block for an
+ * unbounded time and overrun the reader's response timeout.
+ *
+ * @param      instance  pointer to the listener instance to be used.
+ */
+void felica_listener_refill_r2(FelicaListener* instance);
 
 /** Performs WCNT increasing in case of write operation.
  *

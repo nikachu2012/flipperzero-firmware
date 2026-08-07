@@ -75,6 +75,7 @@ FelicaListener* felica_listener_alloc(Nfc* nfc, FelicaData* data) {
     instance->data->data.fs.state.data[0] = 0;
     instance->mode = FELICA_LISTENER_MODE_UNAUTHENTICATED;
     instance->current_system_idx = 0;
+    felica_listener_refill_r2(instance);
     nfc_config(instance->nfc, NfcModeListener, NfcTechFelica);
 
     // nfc_listener_alloc() works on a copy of the loaded NFC data. Log the same
@@ -864,8 +865,12 @@ static FelicaError felica_listener_command_handler_auth1(
     uint8_t challenge_1b[8];
     felica_std_ede_apply(&picc_ede, instance->r1, challenge_1b);
 
-    // Generate R2 and encrypt it with the same PICC-side EDE keys → 2A.
-    furi_hal_random_fill_buf(instance->r2, 8);
+    // Take the pre-generated R2 and encrypt it with the same PICC-side keys → 2A.
+    // The hardware RNG is never touched here: furi_hal_random_fill_buf() spins on a
+    // semaphore shared with the radio core, which can stall for an unbounded time in
+    // the middle of the exchange. R2 is drawn ahead of time and replenished after the
+    // response has gone out.
+    memcpy(instance->r2, instance->r2_next, sizeof(instance->r2));
     uint8_t challenge_2a[8];
     felica_std_ede_apply(&picc_ede, instance->r2, challenge_2a);
     felica_std_ede_keys_free(&picc_ede);
@@ -896,6 +901,7 @@ static FelicaError felica_listener_command_handler_auth1(
     felica_listener_log_hex("Auth1 1A (raw)", challenge_1a, 8);
     felica_listener_log_hex("Auth1 R1 (decrypted)", instance->r1, 8);
     felica_listener_log_hex("Auth1 R2 (generated)", instance->r2, 8);
+    felica_listener_refill_r2(instance);
 
     return error;
 }

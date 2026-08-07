@@ -2,6 +2,7 @@
 
 #include <nfc/helpers/felica_crc.h>
 #include <nfc/helpers/felica_log.h>
+#include <furi_hal_random.h>
 
 #define FELICA_WCNT_MC2_FF_MAX_VALUE           (0x00FFFFFFU)
 #define FELICA_WCNT_MC2_00_MAX_VALUE           (0x00FFFE00U)
@@ -240,6 +241,12 @@ bool felica_listener_check_idm(const FelicaListener* instance, const FelicaIDm* 
     return memcmp(idm.data, request_idm->data, 8) == 0;
 }
 
+void felica_listener_refill_r2(FelicaListener* instance) {
+    furi_assert(instance);
+
+    furi_hal_random_fill_buf(instance->r2_next, sizeof(instance->r2_next));
+}
+
 void felica_listener_set_mode(FelicaListener* instance, uint8_t mode) {
     furi_assert(instance);
 
@@ -267,6 +274,10 @@ void felica_listener_reset(FelicaListener* instance) {
     instance->auth_system_idx = 0;
     memset(instance->r1, 0, 8);
     memset(instance->r2, 0, 8);
+    // No refill here: this runs from the Field Off event on the NFC worker thread,
+    // and the RNG spins on a hardware semaphore shared with the radio core. r2_next
+    // is primed in felica_listener_alloc() and refreshed after each Authentication 1
+    // response, so a nonce is always available without drawing one on the RF path.
     memset(instance->des_user_key, 0, 8);
     memset(instance->des_group_key, 0, 8);
 
