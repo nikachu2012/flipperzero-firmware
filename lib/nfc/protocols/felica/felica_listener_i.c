@@ -1,6 +1,7 @@
 #include "felica_listener_i.h"
 
 #include <nfc/helpers/felica_crc.h>
+#include <nfc/helpers/felica_log.h>
 
 #define FELICA_WCNT_MC2_FF_MAX_VALUE           (0x00FFFFFFU)
 #define FELICA_WCNT_MC2_00_MAX_VALUE           (0x00FFFE00U)
@@ -193,8 +194,7 @@ bool felica_listener_check_block_list_size(
        (req->header.code == FELICA_CMD_READ_WITHOUT_ENCRYPTION ||
         req->header.code == FELICA_CMD_WRITE_WITHOUT_ENCRYPTION ||
         req->header.code == FELICA_CMD_AUTHENTICATION1 ||
-        req->header.code == FELICA_CMD_AUTHENTICATION2 ||
-        req->header.code == FELICA_CMD_READ ||
+        req->header.code == FELICA_CMD_AUTHENTICATION2 || req->header.code == FELICA_CMD_READ ||
         req->header.code == FELICA_CMD_WRITE)) {
         return true;
     }
@@ -768,12 +768,21 @@ FelicaError
 
     felica_crc_append(instance->tx_buffer);
 
+    // Log the frame as it goes on the wire, CRC included, so the trace can be
+    // compared byte for byte against a reader-side capture. This only formats the
+    // line and hands it to the writer thread, so it stays off the response deadline.
+    felica_log_frame(
+        FelicaLogDirectionTx,
+        bit_buffer_get_data(instance->tx_buffer),
+        bit_buffer_get_size_bytes(instance->tx_buffer));
+
     FelicaError ret = FelicaErrorNone;
 
     do {
         NfcError error = nfc_listener_tx(instance->nfc, instance->tx_buffer);
         if(error != NfcErrorNone) {
             ret = felica_listener_process_error(error);
+            felica_log_error("Tx failed: NfcError %d", error);
             break;
         }
     } while(false);

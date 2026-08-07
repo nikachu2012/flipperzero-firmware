@@ -2,6 +2,7 @@
 
 #include "nfc/protocols/nfc_listener_base.h"
 #include <nfc/helpers/felica_crc.h>
+#include <nfc/helpers/felica_log.h>
 #include <furi_hal_nfc.h>
 #include <furi_hal_random.h>
 
@@ -22,6 +23,8 @@
 #define TAG "FelicaListener"
 
 static void felica_listener_log_hex(const char* label, const uint8_t* data, size_t len) {
+    felica_log_buffer(label, data, len);
+
     size_t n = len < FELICA_LISTENER_MAX_BUFFER_SIZE ? len : FELICA_LISTENER_MAX_BUFFER_SIZE;
     char hex[FELICA_LISTENER_MAX_BUFFER_SIZE * 2 + 1];
     for(size_t i = 0; i < n; i++) {
@@ -34,6 +37,8 @@ static void felica_listener_log_hex(const char* label, const uint8_t* data, size
 FelicaListener* felica_listener_alloc(Nfc* nfc, FelicaData* data) {
     furi_assert(nfc);
     furi_assert(data);
+
+    felica_log_session_start();
 
     FelicaListener* instance = malloc(sizeof(FelicaListener));
     instance->nfc = nfc;
@@ -86,6 +91,8 @@ void felica_listener_free(FelicaListener* instance) {
     bit_buffer_free(instance->tx_buffer);
     bit_buffer_free(instance->rx_buffer);
     free(instance);
+
+    felica_log_session_stop();
 }
 
 void felica_listener_set_callback(
@@ -1019,9 +1026,8 @@ static FelicaError felica_listener_command_handler_secure_read(
     felica_listener_log_hex("Read decrypted", decrypted, enc_len);
     uint16_t counter = (uint16_t)(decrypted[0] | ((uint16_t)decrypted[1] << 8));
     if(!felica_std_check_command_counter(instance, counter)) {
-        FURI_LOG_E(
-            TAG,
-            "Read counter not advancing: got %u, must be greater than %u",
+        felica_log_error(
+            "Secure Read counter not advancing: got %u, must be greater than %u",
             counter,
             instance->des_comm_counter);
         return FelicaErrorProtocol;
@@ -1089,8 +1095,7 @@ static FelicaError felica_listener_command_handler_secure_read(
             memcpy(block_data[actual_cnt], pb->block.data, FELICA_DATA_BLOCK_SIZE);
         }
         if(!found) {
-            FURI_LOG_E(
-                TAG,
+            felica_log_error(
                 "Secure Read block missing: system=%u service=%04X block=%04X loaded=%lu",
                 instance->auth_system_idx,
                 svc_code,
@@ -1101,8 +1106,7 @@ static FelicaError felica_listener_command_handler_secure_read(
                 const FelicaPublicBlock* candidate = simple_array_cget(system->public_blocks, j);
                 if((candidate->service_code >> 6) == (svc_code >> 6) &&
                    candidate->block_idx + 1 >= blk_num && candidate->block_idx <= blk_num + 1) {
-                    FURI_LOG_E(
-                        TAG,
+                    felica_log_error(
                         "Secure Read candidate: entry=%lu service=%04X block=%02X",
                         j,
                         candidate->service_code,
@@ -1391,7 +1395,7 @@ static FelicaError felica_listener_process_request(
         }
         return FelicaErrorNotPresent;
     default:
-        FURI_LOG_E(TAG, "FeliCa incorrect command");
+        felica_log_error("Unsupported command %02X", generic_request->header.code);
         return FelicaErrorNotPresent;
     }
 }
@@ -1507,18 +1511,25 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
 
     if(nfc_event->type == NfcEventTypeFieldOn) {
         FURI_LOG_D(TAG, "Field On");
+        felica_log_event("Field On");
     } else if(nfc_event->type == NfcEventTypeListenerActivated) {
         instance->state = Felica_ListenerStateActivated;
         FURI_LOG_D(TAG, "Activated");
+        felica_log_event("Activated");
     } else if(nfc_event->type == NfcEventTypeFieldOff) {
         instance->state = Felica_ListenerStateIdle;
         FURI_LOG_D(TAG, "Field Off");
+        felica_log_event("Field Off");
         felica_listener_reset(instance);
     } else if(nfc_event->type == NfcEventTypeRxEnd) {
         FURI_LOG_D(TAG, "Rx Done");
+        felica_log_frame(
+            FelicaLogDirectionRx,
+            bit_buffer_get_data(nfc_event->data.buffer),
+            bit_buffer_get_size_bytes(nfc_event->data.buffer));
         do {
             if(!felica_crc_check(nfc_event->data.buffer)) {
-                FURI_LOG_E(TAG, "Wrong CRC");
+                felica_log_error("Wrong CRC");
                 break;
             }
 
@@ -1528,7 +1539,8 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
             uint8_t size = bit_buffer_get_size_bytes(nfc_event->data.buffer) - 2;
             if((request->length != size) ||
                (!felica_listener_check_block_list_size(instance, request))) {
-                FURI_LOG_E(TAG, "Wrong request length");
+                felica_log_error(
+                    "Wrong request length: header %u, actual %u", request->length, size);
                 break;
             }
 
@@ -1566,12 +1578,12 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
                     if(error == FelicaErrorFeatureUnsupported) {
                         command = NfcCommandReset;
                     } else if(error != FelicaErrorNone) {
-                        FURI_LOG_E(
-                            TAG, "Error when handling Polling with System Code: %2X", error);
+                        felica_log_error(
+                            "Error when handling Polling with System Code: %02X", error);
                     }
                     break;
                 } else {
-                    FURI_LOG_E(TAG, "Hardware Polling command leaking through");
+                    felica_log_error("Hardware Polling command leaking through");
                     break;
                 }
             } else if(
@@ -1580,13 +1592,14 @@ NfcCommand felica_listener_run(NfcGenericEvent event, void* context) {
                 request->header.code != FELICA_CMD_AUTHENTICATION1 &&
                 request->header.code != FELICA_CMD_AUTHENTICATION2 &&
                 !felica_listener_check_idm(instance, &request->header.idm)) {
-                FURI_LOG_E(TAG, "Wrong IDm");
+                felica_log_error("Wrong IDm");
                 break;
             }
 
             FelicaError error = felica_listener_process_request(instance, request);
             if(error != FelicaErrorNone) {
-                FURI_LOG_E(TAG, "Processing error: %2X", error);
+                felica_log_error(
+                    "Processing error on command %02X: %02X", request->header.code, error);
             }
         } while(false);
         bit_buffer_reset(nfc_event->data.buffer);
