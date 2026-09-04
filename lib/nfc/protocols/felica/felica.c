@@ -1271,35 +1271,31 @@ void felica_service_get_attribute_string(const FelicaService* service, FuriStrin
     furi_check(service);
     furi_check(str);
 
-    bool is_public = (service->attr & FELICA_SERVICE_ATTRIBUTE_UNAUTH_READ) != 0;
-    furi_string_cat_str(str, is_public ? "| Public  " : "| Private ");
+    furi_string_cat_str(
+        str, felica_service_attr_needs_auth(service->attr) ? "| Private " : "| Public  ");
 
-    bool is_purse = (service->attr & FELICA_SERVICE_ATTRIBUTE_PURSE) != 0;
-    // Subfield bitwise attributes are applicable depending on is PURSE or not
-
-    if(is_purse) {
+    // The sub-attribute bits mean different things on a Purse Service than elsewhere.
+    if(felica_service_attr_is_purse(service->attr)) {
         furi_string_cat_str(str, "| Purse  |");
-        switch((service->attr & FELICA_SERVICE_ATTRIBUTE_PURSE_SUBFIELD) >> 1) {
-        case 0:
+        switch(felica_service_attr_purse_mode(service->attr)) {
+        case FELICA_SERVICE_PURSE_MODE_DIRECT:
             furi_string_cat_str(str, " Direct     |");
             break;
-        case 1:
+        case FELICA_SERVICE_PURSE_MODE_CASHBACK_DECREMENT:
             furi_string_cat_str(str, " Cashback   |");
             break;
-        case 2:
+        case FELICA_SERVICE_PURSE_MODE_DECREMENT:
             furi_string_cat_str(str, " Decrement  |");
             break;
-        case 3:
-            furi_string_cat_str(str, " Read Only  |");
-            break;
         default:
-            furi_string_cat_str(str, " Unknown    |");
+            furi_string_cat_str(str, " Read Only  |");
             break;
         }
     } else {
-        bool is_random = (service->attr & FELICA_SERVICE_ATTRIBUTE_RANDOM_ACCESS) != 0;
-        furi_string_cat_str(str, is_random ? "| Random |" : "| Cyclic |");
-        bool is_readonly = (service->attr & FELICA_SERVICE_ATTRIBUTE_READ_ONLY) != 0;
-        furi_string_cat_str(str, is_readonly ? " Read Only  |" : " Read/Write |");
+        furi_string_cat_str(
+            str, felica_service_attr_is_cyclic(service->attr) ? "| Cyclic |" : "| Random |");
+        furi_string_cat_str(
+            str,
+            felica_service_attr_is_read_only(service->attr) ? " Read Only  |" : " Read/Write |");
     }
 }

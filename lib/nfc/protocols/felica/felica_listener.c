@@ -258,6 +258,329 @@ static FelicaPublicBlock*
     return sibling;
 }
 
+#define FELICA_STANDARD_SERVICE_MAX     (16U)
+#define FELICA_STANDARD_WRITE_BLOCK_MAX (16U)
+
+typedef struct {
+    uint8_t access_mode;
+    uint8_t service_index;
+    uint16_t block_number;
+} FelicaStandardBlockListElement;
+
+// Parses a Block List. Both the two-byte and the three-byte Block List Element form are
+// accepted; the three-byte form carries a little-endian 16-bit Block Number.
+// Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 4.2.
+static bool felica_std_parse_block_list(
+    const uint8_t* data,
+    size_t data_len,
+    uint8_t block_count,
+    FelicaStandardBlockListElement* elements,
+    size_t elements_count,
+    size_t* bytes_consumed) {
+    if((block_count == 0) || (block_count > elements_count)) return false;
+
+    size_t offset = 0;
+    for(uint8_t i = 0; i < block_count; i++) {
+        if(data_len - offset < 2) return false;
+
+        const bool is_two_byte = (data[offset] & 0x80U) != 0;
+        const size_t element_size = is_two_byte ? 2U : 3U;
+        if(data_len - offset < element_size) return false;
+
+        elements[i].access_mode = (uint8_t)((data[offset] >> 4) & 0x07U);
+        elements[i].service_index = data[offset] & 0x0FU;
+        elements[i].block_number = data[offset + 1];
+        if(!is_two_byte) {
+            elements[i].block_number |= (uint16_t)data[offset + 2] << 8;
+        }
+        offset += element_size;
+    }
+
+    *bytes_consumed = offset;
+    return true;
+}
+
+// A Service Code has to exist verbatim to be writable. Unlike Block storage, where a
+// dump may hold the Blocks of only one of several Overlap Service codes, Search Service
+// Code enumerates every Service Code the card carries.
+static const FelicaService*
+    felica_std_find_service(const FelicaSystem* system, uint16_t svc_code) {
+    const uint32_t svc_count = simple_array_get_count(system->services);
+    for(uint32_t i = 0; i < svc_count; i++) {
+        const FelicaService* svc = simple_array_cget(system->services, i);
+        if(svc->code == svc_code) return svc;
+    }
+    return NULL;
+}
+
+static uint32_t felica_std_get_u32le(const uint8_t* data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8) | ((uint32_t)data[2] << 16) |
+           ((uint32_t)data[3] << 24);
+}
+
+static void felica_std_set_u32le(uint8_t* data, uint32_t value) {
+    data[0] = (uint8_t)(value & 0xFF);
+    data[1] = (uint8_t)((value >> 8) & 0xFF);
+    data[2] = (uint8_t)((value >> 16) & 0xFF);
+    data[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+// A decrement or cashback Write carries the amount to apply in the purse data field and
+// the transaction's Execution ID in the last two bytes; everything between is "don't
+// care". Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 3.4.4 and
+// Figures 3-15 to 3-17.
+static bool felica_std_purse_execution_id_matches(const uint8_t* stored, const uint8_t* written) {
+    return memcmp(
+               stored + FELICA_PURSE_EXECUTION_ID_OFFSET,
+               written + FELICA_PURSE_EXECUTION_ID_OFFSET,
+               FELICA_PURSE_EXECUTION_ID_SIZE) == 0;
+}
+
+// Checks a Purse Service Write without mutating anything, so a multi-block Write can be
+// rejected before any Block changes.
+static bool felica_std_purse_check(
+    uint8_t attr,
+    uint8_t access_mode,
+    const uint8_t* stored,
+    const uint8_t* written,
+    uint8_t* sf2) {
+    if(felica_service_attr_purse_mode(attr) == FELICA_SERVICE_PURSE_MODE_DIRECT) return true;
+
+    // A repeated Execution ID means the reader retransmitted the same transaction: the
+    // command completes normally but the card leaves the Block alone.
+    if(felica_std_purse_execution_id_matches(stored, written)) return true;
+
+    const uint32_t amount = felica_std_get_u32le(written + FELICA_PURSE_VALUE_OFFSET);
+    const uint32_t value = felica_std_get_u32le(stored + FELICA_PURSE_VALUE_OFFSET);
+
+    if(access_mode == FELICA_BLOCK_LIST_ACCESS_MODE_CASHBACK) {
+        const uint32_t cashback = felica_std_get_u32le(stored + FELICA_PURSE_CASHBACK_OFFSET);
+        if(amount > cashback) {
+            *sf2 = 0x02;
+            return false;
+        }
+        if(amount > UINT32_MAX - value) {
+            *sf2 = 0x01;
+            return false;
+        }
+    } else if(amount > value) {
+        *sf2 = 0x01;
+        return false;
+    }
+    return true;
+}
+
+static void felica_std_purse_apply(
+    uint8_t attr,
+    uint8_t access_mode,
+    uint8_t* stored,
+    const uint8_t* written) {
+    if(felica_service_attr_purse_mode(attr) == FELICA_SERVICE_PURSE_MODE_DIRECT) {
+        memcpy(stored, written, FELICA_DATA_BLOCK_SIZE);
+        return;
+    }
+    if(felica_std_purse_execution_id_matches(stored, written)) return;
+
+    const uint32_t amount = felica_std_get_u32le(written + FELICA_PURSE_VALUE_OFFSET);
+    uint32_t value = felica_std_get_u32le(stored + FELICA_PURSE_VALUE_OFFSET);
+
+    if(access_mode == FELICA_BLOCK_LIST_ACCESS_MODE_CASHBACK) {
+        value += amount;
+        // A cashback resets the cashback data whatever amount was returned to the purse.
+        felica_std_set_u32le(stored + FELICA_PURSE_CASHBACK_OFFSET, 0);
+    } else {
+        value -= amount;
+        // A decrement records what it took off, which is what a later cashback may return.
+        felica_std_set_u32le(stored + FELICA_PURSE_CASHBACK_OFFSET, amount);
+    }
+    felica_std_set_u32le(stored + FELICA_PURSE_VALUE_OFFSET, value);
+    memcpy(
+        stored + FELICA_PURSE_EXECUTION_ID_OFFSET,
+        written + FELICA_PURSE_EXECUTION_ID_OFFSET,
+        FELICA_PURSE_EXECUTION_ID_SIZE);
+    // The written user data field is "don't care", so the card keeps the one it holds.
+}
+
+// Number of Blocks the dump holds for a Service, counted upwards from Block 0.
+static uint16_t felica_std_service_block_count(const FelicaSystem* system, uint16_t svc_code) {
+    uint16_t count = 0;
+    while((count <= UINT8_MAX) && felica_std_find_public_block(system, svc_code, count))
+        count++;
+    return count;
+}
+
+// A Cyclic Service Write always addresses Block Number 0: the new data becomes the latest
+// entry and every older entry shifts one Block along, dropping the oldest.
+// Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 3.4.3.
+static void
+    felica_std_cyclic_write(FelicaSystem* system, uint16_t svc_code, const uint8_t* written) {
+    FelicaPublicBlock* latest = felica_std_find_public_block_mut(system, svc_code, 0);
+    if(!latest) return;
+
+    // Data identical to the latest entry changes nothing, so a retransmitted log entry
+    // cannot push the rest of the ring out.
+    if(memcmp(latest->block.data, written, FELICA_DATA_BLOCK_SIZE) == 0) return;
+
+    const uint16_t count = felica_std_service_block_count(system, svc_code);
+    for(uint16_t i = count; i-- > 1;) {
+        FelicaPublicBlock* dst = felica_std_find_public_block_mut(system, svc_code, i);
+        const FelicaPublicBlock* src = felica_std_find_public_block(system, svc_code, i - 1);
+        if(dst && src) memcpy(dst->block.data, src->block.data, FELICA_DATA_BLOCK_SIZE);
+    }
+    memcpy(latest->block.data, written, FELICA_DATA_BLOCK_SIZE);
+}
+
+typedef struct {
+    const FelicaService* service;
+    FelicaPublicBlock* block;
+    uint16_t svc_code;
+    uint8_t access_mode;
+} FelicaStandardWriteTarget;
+
+// Validates one Block List Element of a Write against the Service Attribute without
+// touching card data. `unencrypted` selects the Write Without Encryption rules, which
+// additionally demand an authentication-not-required Service.
+// Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 4.4.6.
+static bool felica_std_prepare_write_target(
+    FelicaSystem* system,
+    uint16_t svc_code,
+    uint16_t block_number,
+    uint8_t access_mode,
+    const uint8_t* written,
+    bool unencrypted,
+    FelicaStandardWriteTarget* target,
+    uint8_t* sf2) {
+    const FelicaService* service = felica_std_find_service(system, svc_code);
+    if(!service) {
+        // The Service list comes from the dump, so a miss here is usually a dump that was
+        // captured or edited without its Service section rather than a bad command.
+        felica_log_error("Write to service %04X: not in the dump's service list", svc_code);
+        *sf2 = 0xA6;
+        return false;
+    }
+
+    if(access_mode == FELICA_BLOCK_LIST_ACCESS_MODE_KEY_CHANGE) {
+        // Legal on a DES Write, but this listener implements no key change.
+        *sf2 = 0xAA;
+        return false;
+    }
+    if(access_mode == FELICA_BLOCK_LIST_ACCESS_MODE_CASHBACK) {
+        // Cashback access is only defined for a Purse Service carrying the cashback
+        // function, that is the Cashback/Decrement Access attribute.
+        if(!felica_service_attr_has_cashback(service->attr)) {
+            *sf2 = 0xA7;
+            return false;
+        }
+    } else if(access_mode != FELICA_BLOCK_LIST_ACCESS_MODE_NORMAL) {
+        *sf2 = 0xA7;
+        return false;
+    }
+
+    // 0xA5 reports a Service that cannot be accessed the way the command asks for.
+    if(felica_service_attr_is_read_only(service->attr)) {
+        *sf2 = 0xA5;
+        return false;
+    }
+    // The DES Write is left permissive on this point: readers in the field do address
+    // authentication-not-required Services inside a session.
+    if(unencrypted && felica_service_attr_needs_auth(service->attr)) {
+        *sf2 = 0xA5;
+        return false;
+    }
+
+    // A Cyclic Service is written through Block Number 0 only; the card itself picks the
+    // physical Block that gets overwritten.
+    if(felica_service_attr_is_cyclic(service->attr) && (block_number != 0)) {
+        *sf2 = 0xA5;
+        return false;
+    }
+
+    FelicaPublicBlock* block =
+        (block_number > UINT8_MAX) ?
+            NULL :
+            felica_std_find_public_block_mut(system, svc_code, block_number);
+    if(!block) {
+        *sf2 = 0xA8;
+        return false;
+    }
+
+    if(felica_service_attr_is_purse(service->attr) &&
+       !felica_std_purse_check(service->attr, access_mode, block->block.data, written, sf2)) {
+        return false;
+    }
+
+    target->service = service;
+    target->block = block;
+    target->svc_code = svc_code;
+    target->access_mode = access_mode;
+    return true;
+}
+
+// Validates one Block List Element of a Read and resolves it to stored Block Data.
+// `unencrypted` selects the Read Without Encryption rules, which may only touch
+// authentication-not-required Services.
+// Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 4.4.5.
+static const FelicaPublicBlock* felica_std_prepare_read_target(
+    const FelicaSystem* system,
+    uint16_t svc_code,
+    uint16_t block_number,
+    uint8_t access_mode,
+    bool unencrypted,
+    uint8_t* sf2) {
+    const FelicaService* service = felica_std_find_service(system, svc_code);
+    if(!service) {
+        // See the note in felica_std_prepare_write_target.
+        felica_log_error("Read of service %04X: not in the dump's service list", svc_code);
+        *sf2 = 0xA6;
+        return NULL;
+    }
+
+    // Cashback and key change are write-side modes; a Read only takes plain access.
+    if(access_mode != FELICA_BLOCK_LIST_ACCESS_MODE_NORMAL) {
+        *sf2 = 0xA7;
+        return NULL;
+    }
+
+    // 0xA5 reports a Service that cannot be accessed the way the command asks for.
+    if(unencrypted && felica_service_attr_needs_auth(service->attr)) {
+        *sf2 = 0xA5;
+        return NULL;
+    }
+
+    // A Cyclic Service reads Block 0 as the latest entry and counts backwards from
+    // there, which is exactly how the dump stores it, so no remapping is needed.
+    const FelicaPublicBlock* block =
+        (block_number > UINT8_MAX) ? NULL :
+                                     felica_std_find_public_block(system, svc_code, block_number);
+    if(!block) {
+        *sf2 = 0xA8;
+        return NULL;
+    }
+    return block;
+}
+
+// Applies one validated Block List Element. The purse arithmetic is checked again here
+// because a single command may address the same purse Block more than once.
+static bool felica_std_apply_write_target(
+    FelicaSystem* system,
+    const FelicaStandardWriteTarget* target,
+    const uint8_t* written,
+    uint8_t* sf2) {
+    const uint8_t attr = target->service->attr;
+
+    if(felica_service_attr_is_purse(attr)) {
+        if(!felica_std_purse_check(
+               attr, target->access_mode, target->block->block.data, written, sf2))
+            return false;
+        felica_std_purse_apply(attr, target->access_mode, target->block->block.data, written);
+    } else if(felica_service_attr_is_cyclic(attr)) {
+        felica_std_cyclic_write(system, target->svc_code, written);
+    } else {
+        memcpy(target->block->block.data, written, FELICA_DATA_BLOCK_SIZE);
+    }
+    return true;
+}
+
 // A successful response consists of the command response header, one block-count
 // byte, and 16 bytes per block. Leave room for the CRC appended before transmit.
 #define FELICA_STANDARD_READ_RESPONSE_HEADER_SIZE \
@@ -271,62 +594,85 @@ static FelicaError felica_listener_command_handler_standard_read(
     FelicaListener* instance,
     const FelicaListenerGenericRequest* const generic_request) {
     const uint8_t* raw = (const uint8_t*)generic_request;
-    uint8_t service_num = raw[10];
-    if(service_num == 0 || service_num > 16) {
-        return FelicaErrorProtocol;
-    }
-
-    uint16_t service_codes[16];
-    for(uint8_t i = 0; i < service_num; i++) {
-        service_codes[i] = (uint16_t)(raw[11 + i * 2] | ((uint16_t)raw[12 + i * 2] << 8));
-    }
-
-    const uint8_t block_count = raw[11 + service_num * 2];
-    const uint8_t* bptr = raw + 12 + service_num * 2;
-
-    const FelicaSystem* system = felica_listener_get_current_system(instance);
+    // felica_listener_run has already checked raw[0] against the received frame length.
+    const size_t frame_len = raw[0];
 
     uint8_t sf1 = 0x00, sf2 = 0x00;
+
+    const size_t service_num_offset = 10;
+    if(frame_len <= service_num_offset) return FelicaErrorProtocol;
+
+    const uint8_t service_num = raw[service_num_offset];
+    if((service_num == 0) || (service_num > FELICA_STANDARD_SERVICE_MAX)) {
+        sf1 = 0xFF;
+        sf2 = 0xA1;
+    }
+
+    uint16_t service_codes[FELICA_STANDARD_SERVICE_MAX];
+    FelicaStandardBlockListElement block_list[FELICA_STANDARD_READ_BLOCK_MAX];
+    uint8_t block_count = 0;
+
+    if(sf1 == 0) {
+        const size_t block_count_offset = service_num_offset + 1 + (size_t)service_num * 2;
+        if(frame_len <= block_count_offset) return FelicaErrorProtocol;
+
+        for(uint8_t i = 0; i < service_num; i++) {
+            service_codes[i] = (uint16_t)(raw[service_num_offset + 1 + i * 2] |
+                                          ((uint16_t)raw[service_num_offset + 2 + i * 2] << 8));
+        }
+
+        block_count = raw[block_count_offset];
+        if((block_count == 0) || (block_count > FELICA_STANDARD_READ_BLOCK_MAX)) {
+            sf1 = 0xFF;
+            sf2 = 0xA2;
+        } else {
+            size_t block_list_size = 0;
+            if(!felica_std_parse_block_list(
+                   raw + block_count_offset + 1,
+                   frame_len - (block_count_offset + 1),
+                   block_count,
+                   block_list,
+                   COUNT_OF(block_list),
+                   &block_list_size)) {
+                return FelicaErrorProtocol;
+            }
+        }
+    }
+
+    const FelicaSystem* system = felica_listener_get_current_system(instance);
+    if((sf1 == 0) && !system) {
+        sf1 = 0xFF;
+        sf2 = 0xA6;
+    }
+
+    // Status Flag1 carries the one-based position in the Block List at which the error
+    // occurred; 0xFF is reserved for errors that do not depend on a list.
     uint8_t block_data[FELICA_STANDARD_READ_BLOCK_MAX][FELICA_DATA_BLOCK_SIZE];
     uint8_t actual_block_count = 0;
 
-    if((block_count == 0) || (block_count > FELICA_STANDARD_READ_BLOCK_MAX)) {
-        sf1 = 0xFF;
-        sf2 = 0xA2;
-    }
+    if(sf1 == 0) {
+        for(uint8_t i = 0; i < block_count; i++) {
+            if(block_list[i].service_index >= service_num) {
+                sf1 = (uint8_t)(i + 1);
+                sf2 = 0xA3;
+                break;
+            }
 
-    for(uint8_t i = 0; (sf1 == 0) && (i < block_count); i++) {
-        uint8_t svc_idx = bptr[0] & 0x0F;
-        bool is_2byte = (bptr[0] >> 7) != 0;
-        uint8_t blk_num;
+            const FelicaPublicBlock* pb = felica_std_prepare_read_target(
+                system,
+                service_codes[block_list[i].service_index],
+                block_list[i].block_number,
+                block_list[i].access_mode,
+                true,
+                &sf2);
+            if(!pb) {
+                sf1 = (uint8_t)(i + 1);
+                break;
+            }
 
-        if(is_2byte) {
-            blk_num = bptr[1];
-            bptr += 2;
-        } else {
-            blk_num = bptr[1]; // lower byte of LE block number; upper byte (bptr[2]) must be 0
-            bptr += 3;
-        }
-
-        if(svc_idx >= service_num || !system) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-
-        uint16_t svc_code = service_codes[svc_idx];
-        const FelicaPublicBlock* pb = felica_std_find_public_block(system, svc_code, blk_num);
-        bool found = pb != NULL;
-        if(found) {
             memcpy(block_data[actual_block_count], pb->block.data, FELICA_DATA_BLOCK_SIZE);
+            actual_block_count++;
         }
-
-        if(!found) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-        actual_block_count++;
     }
 
     size_t resp_size =
@@ -357,81 +703,98 @@ static FelicaError felica_listener_command_handler_standard_write(
     FelicaListener* instance,
     const FelicaListenerGenericRequest* const generic_request) {
     const uint8_t* raw = (const uint8_t*)generic_request;
-    uint8_t service_num = raw[10];
-    if(service_num == 0 || service_num > 16) {
-        return FelicaErrorProtocol;
-    }
-
-    uint16_t service_codes[16];
-    for(uint8_t i = 0; i < service_num; i++) {
-        service_codes[i] = (uint16_t)(raw[11 + i * 2] | ((uint16_t)raw[12 + i * 2] << 8));
-    }
-
-    uint8_t block_count = raw[11 + service_num * 2];
-    const uint8_t* bptr = raw + 12 + service_num * 2;
-
-    FelicaSystem* system = felica_listener_get_current_system_mut(instance);
+    // felica_listener_run has already checked raw[0] against the received frame length.
+    const size_t frame_len = raw[0];
 
     uint8_t sf1 = 0x00, sf2 = 0x00;
 
-    struct {
-        uint16_t svc_code;
-        uint8_t blk_num;
-    } targets[16];
-    uint8_t valid_count = 0;
+    const size_t service_num_offset = 10;
+    if(frame_len <= service_num_offset) return FelicaErrorProtocol;
 
-    for(uint8_t i = 0; i < block_count && i < 16; i++) {
-        uint8_t svc_idx = bptr[0] & 0x0F;
-        bool is_2byte = (bptr[0] >> 7) != 0;
-        uint8_t blk_num;
+    const uint8_t service_num = raw[service_num_offset];
+    if((service_num == 0) || (service_num > FELICA_STANDARD_SERVICE_MAX)) {
+        sf1 = 0xFF;
+        sf2 = 0xA1;
+    }
 
-        if(is_2byte) {
-            blk_num = bptr[1];
-            bptr += 2;
-        } else {
-            blk_num = bptr[1];
-            bptr += 3;
+    uint16_t service_codes[FELICA_STANDARD_SERVICE_MAX];
+    FelicaStandardBlockListElement block_list[FELICA_STANDARD_WRITE_BLOCK_MAX];
+    uint8_t block_count = 0;
+    const uint8_t* block_data = NULL;
+
+    if(sf1 == 0) {
+        const size_t block_count_offset = service_num_offset + 1 + (size_t)service_num * 2;
+        if(frame_len <= block_count_offset) return FelicaErrorProtocol;
+
+        for(uint8_t i = 0; i < service_num; i++) {
+            service_codes[i] = (uint16_t)(raw[service_num_offset + 1 + i * 2] |
+                                          ((uint16_t)raw[service_num_offset + 2 + i * 2] << 8));
         }
 
-        if(svc_idx >= service_num || !system) {
+        block_count = raw[block_count_offset];
+        if((block_count == 0) || (block_count > FELICA_STANDARD_WRITE_BLOCK_MAX)) {
             sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
+            sf2 = 0xA2;
+        } else {
+            size_t block_list_size = 0;
+            if(!felica_std_parse_block_list(
+                   raw + block_count_offset + 1,
+                   frame_len - (block_count_offset + 1),
+                   block_count,
+                   block_list,
+                   COUNT_OF(block_list),
+                   &block_list_size)) {
+                return FelicaErrorProtocol;
+            }
+
+            const size_t block_data_offset = block_count_offset + 1 + block_list_size;
+            const size_t block_data_size = (size_t)block_count * FELICA_DATA_BLOCK_SIZE;
+            if((block_data_offset > frame_len) ||
+               (block_data_size > frame_len - block_data_offset)) {
+                return FelicaErrorProtocol;
+            }
+            block_data = raw + block_data_offset;
         }
+    }
 
-        uint16_t svc_code = service_codes[svc_idx];
+    FelicaSystem* system = felica_listener_get_current_system_mut(instance);
+    if((sf1 == 0) && !system) {
+        sf1 = 0xFF;
+        sf2 = 0xA6;
+    }
 
-        uint32_t svc_count = simple_array_get_count(system->services);
-        bool svc_found = false;
-        for(uint32_t k = 0; k < svc_count; k++) {
-            const FelicaService* svc = simple_array_cget(system->services, k);
-            if(svc->code == svc_code) {
-                svc_found = true;
-                if(svc->attr & FELICA_SERVICE_ATTRIBUTE_READ_ONLY) {
-                    sf1 = 0xFF;
-                    sf2 = 0xA6;
-                }
+    // Status Flag1 carries the one-based position in the Block List at which the error
+    // occurred; 0xFF is reserved for errors that do not depend on a list.
+    FelicaStandardWriteTarget targets[FELICA_STANDARD_WRITE_BLOCK_MAX];
+    if(sf1 == 0) {
+        for(uint8_t i = 0; i < block_count; i++) {
+            if(block_list[i].service_index >= service_num) {
+                sf1 = (uint8_t)(i + 1);
+                sf2 = 0xA3;
+                break;
+            }
+            if(!felica_std_prepare_write_target(
+                   system,
+                   service_codes[block_list[i].service_index],
+                   block_list[i].block_number,
+                   block_list[i].access_mode,
+                   block_data + (size_t)i * FELICA_DATA_BLOCK_SIZE,
+                   true,
+                   &targets[i],
+                   &sf2)) {
+                sf1 = (uint8_t)(i + 1);
                 break;
             }
         }
-        if(!svc_found || sf1 != 0) break;
-
-        targets[i].svc_code = svc_code;
-        targets[i].blk_num = blk_num;
-        valid_count++;
     }
 
-    if(sf1 == 0 && system) {
-        for(uint8_t i = 0; i < valid_count; i++) {
-            FelicaPublicBlock* pb =
-                felica_std_find_public_block_mut(system, targets[i].svc_code, targets[i].blk_num);
-            bool found = pb != NULL;
-            if(found) {
-                memcpy(pb->block.data, bptr + i * FELICA_DATA_BLOCK_SIZE, FELICA_DATA_BLOCK_SIZE);
-            }
-            if(!found) {
-                sf1 = 0xFF;
-                sf2 = 0xA8;
+    // Everything is validated before any Block changes, so a rejected multi-block Write
+    // leaves the card untouched.
+    if(sf1 == 0) {
+        for(uint8_t i = 0; i < block_count; i++) {
+            if(!felica_std_apply_write_target(
+                   system, &targets[i], block_data + (size_t)i * FELICA_DATA_BLOCK_SIZE, &sf2)) {
+                sf1 = (uint8_t)(i + 1);
                 break;
             }
         }
@@ -1000,40 +1363,6 @@ static FelicaError felica_listener_command_handler_auth2(
 #define FELICA_STANDARD_SECURE_READ_BLOCK_MAX  (14U)
 #define FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX (8U)
 
-typedef struct {
-    uint8_t service_index;
-    uint16_t block_number;
-} FelicaStandardSecureBlockListElement;
-
-static bool felica_std_parse_secure_block_list(
-    const uint8_t* data,
-    size_t data_len,
-    uint8_t block_count,
-    FelicaStandardSecureBlockListElement* elements,
-    size_t elements_count,
-    size_t* bytes_consumed) {
-    if((block_count == 0) || (block_count > elements_count)) return false;
-
-    size_t offset = 0;
-    for(uint8_t i = 0; i < block_count; i++) {
-        if(data_len - offset < 2) return false;
-
-        const bool is_two_byte = (data[offset] & 0x80U) != 0;
-        const size_t element_size = is_two_byte ? 2U : 3U;
-        if(data_len - offset < element_size) return false;
-
-        elements[i].service_index = data[offset] & 0x0FU;
-        elements[i].block_number = data[offset + 1];
-        if(!is_two_byte) {
-            elements[i].block_number |= (uint16_t)data[offset + 2] << 8;
-        }
-        offset += element_size;
-    }
-
-    *bytes_consumed = offset;
-    return true;
-}
-
 // Readers in the field use both PKCS#5 and zero padding for secure requests.
 // Accept either representation; the padding remains authenticated because it is
 // included in the MAC that is verified before this function is called.
@@ -1133,9 +1462,9 @@ static FelicaError felica_listener_command_handler_secure_read(
     // Parse block list after counter(2) + communication ID(6) + block count(1).
     const size_t block_count_offset = 2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE;
     const uint8_t blk_cnt = decrypted[block_count_offset];
-    FelicaStandardSecureBlockListElement block_list[FELICA_STANDARD_SECURE_READ_BLOCK_MAX];
+    FelicaStandardBlockListElement block_list[FELICA_STANDARD_SECURE_READ_BLOCK_MAX];
     size_t block_list_size = 0;
-    if(!felica_std_parse_secure_block_list(
+    if(!felica_std_parse_block_list(
            decrypted + block_count_offset + 1,
            mac_data_len - (block_count_offset + 1),
            blk_cnt,
@@ -1293,9 +1622,9 @@ static FelicaError felica_listener_command_handler_secure_write(
     // Parse block list after counter(2) + communication ID(6) + block count(1).
     const size_t block_count_offset = 2 + FELICA_STANDARD_COMMUNICATION_ID_SIZE;
     const uint8_t blk_cnt = decrypted[block_count_offset];
-    FelicaStandardSecureBlockListElement block_list[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
+    FelicaStandardBlockListElement block_list[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
     size_t block_list_size = 0;
-    if(!felica_std_parse_secure_block_list(
+    if(!felica_std_parse_block_list(
            decrypted + block_count_offset + 1,
            mac_data_len - (block_count_offset + 1),
            blk_cnt,
@@ -1315,74 +1644,54 @@ static FelicaError felica_listener_command_handler_secure_write(
     if(!felica_std_check_request_padding(decrypted, mac_data_len, unpadded_len))
         return FelicaErrorProtocol;
 
-    struct {
-        uint16_t svc_code;
-        uint16_t blk_num;
-        FelicaPublicBlock* block;
-    } targets[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
-    uint8_t valid_cnt = 0;
-    uint8_t sf1 = 0, sf2 = 0;
-
-    for(uint8_t i = 0; i < blk_cnt; i++) {
-        const uint8_t svc_idx = block_list[i].service_index;
-        if(svc_idx >= instance->auth_service_count) {
-            sf1 = 0xFF;
-            sf2 = 0xA8;
-            break;
-        }
-        targets[valid_cnt].svc_code = instance->auth_service_codes[svc_idx];
-        targets[valid_cnt].blk_num = block_list[i].block_number;
-        targets[valid_cnt].block = NULL;
-        valid_cnt++;
-    }
-
     FelicaSystem* system = NULL;
     if(instance->auth_system_idx < simple_array_get_count(instance->data->systems)) {
         system = simple_array_get(instance->data->systems, instance->auth_system_idx);
     }
-    if(sf1 == 0 && !system) {
+
+    uint8_t sf1 = 0, sf2 = 0;
+    if(!system) {
         sf1 = 0xFF;
-        sf2 = 0xA8;
+        sf2 = 0xA6;
     }
 
-    // Validate every target before changing any block, so a failed multi-block write is atomic.
-    if(sf1 == 0 && system) {
-        for(uint8_t i = 0; i < valid_cnt; i++) {
-            // Check service is writable
-            bool svc_writable = false;
-            uint32_t svc_count = simple_array_get_count(system->services);
-            for(uint32_t k = 0; k < svc_count; k++) {
-                const FelicaService* svc = simple_array_cget(system->services, k);
-                if(svc->code == targets[i].svc_code) {
-                    svc_writable = !(svc->attr & FELICA_SERVICE_ATTRIBUTE_READ_ONLY);
-                    break;
-                }
-            }
-            if(!svc_writable) {
-                sf1 = 0xFF;
-                sf2 = 0xA6;
+    // Status Flag1 carries the one-based position in the Block List at which the error
+    // occurred; 0xFF is reserved for errors that do not depend on a list.
+    FelicaStandardWriteTarget targets[FELICA_STANDARD_SECURE_WRITE_BLOCK_MAX];
+    if(sf1 == 0) {
+        for(uint8_t i = 0; i < blk_cnt; i++) {
+            if(block_list[i].service_index >= instance->auth_service_count) {
+                sf1 = (uint8_t)(i + 1);
+                sf2 = 0xA3;
                 break;
             }
-            FelicaPublicBlock* pb =
-                felica_std_find_public_block_mut(system, targets[i].svc_code, targets[i].blk_num);
-            bool found = pb != NULL;
-            if(found) {
-                targets[i].block = pb;
-            }
-            if(!found) {
-                sf1 = 0xFF;
-                sf2 = 0xA8;
+            if(!felica_std_prepare_write_target(
+                   system,
+                   instance->auth_service_codes[block_list[i].service_index],
+                   block_list[i].block_number,
+                   block_list[i].access_mode,
+                   decrypted + block_data_offset + (size_t)i * FELICA_DATA_BLOCK_SIZE,
+                   false,
+                   &targets[i],
+                   &sf2)) {
+                sf1 = (uint8_t)(i + 1);
                 break;
             }
         }
     }
 
+    // Everything is validated before any Block changes, so a rejected multi-block Write
+    // leaves the card untouched.
     if(sf1 == 0) {
-        for(uint8_t i = 0; i < valid_cnt; i++) {
-            memcpy(
-                targets[i].block->block.data,
-                decrypted + block_data_offset + i * FELICA_DATA_BLOCK_SIZE,
-                FELICA_DATA_BLOCK_SIZE);
+        for(uint8_t i = 0; i < blk_cnt; i++) {
+            if(!felica_std_apply_write_target(
+                   system,
+                   &targets[i],
+                   decrypted + block_data_offset + (size_t)i * FELICA_DATA_BLOCK_SIZE,
+                   &sf2)) {
+                sf1 = (uint8_t)(i + 1);
+                break;
+            }
         }
     }
 

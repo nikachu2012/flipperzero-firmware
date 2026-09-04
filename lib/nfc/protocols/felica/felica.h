@@ -79,6 +79,66 @@ extern "C" {
 #define FELICA_SERVICE_ATTRIBUTE_CYCLIC         (0b001100)
 #define FELICA_SERVICE_ATTRIBUTE_PURSE          (0b010000)
 #define FELICA_SERVICE_ATTRIBUTE_PURSE_SUBFIELD (0b000110)
+/** @brief Random Service is 0b0010xx and Cyclic Service 0b0011xx, so both set the
+  * Random Access bit and only this one tells them apart. */
+#define FELICA_SERVICE_ATTRIBUTE_CYCLIC_FLAG    (0b000100)
+
+/** @brief Purse Service sub-attribute, bits 2:1 of the Service Attribute.
+  * Reference: FeliCa Card User's Manual Excerpted Edition v2.0, Table 3-6. */
+#define FELICA_SERVICE_PURSE_MODE_DIRECT             (0)
+#define FELICA_SERVICE_PURSE_MODE_CASHBACK_DECREMENT (1)
+#define FELICA_SERVICE_PURSE_MODE_DECREMENT          (2)
+#define FELICA_SERVICE_PURSE_MODE_READ_ONLY          (3)
+
+/** @brief Field layout of a Purse Service Block. Purse data and cashback data are
+  * little endian. Reference: FeliCa Card User's Manual Excerpted Edition v2.0,
+  * Figures 3-15 to 3-17. */
+#define FELICA_PURSE_VALUE_OFFSET        (0U)
+#define FELICA_PURSE_VALUE_SIZE          (4U)
+#define FELICA_PURSE_CASHBACK_OFFSET     (4U)
+#define FELICA_PURSE_CASHBACK_SIZE       (4U)
+#define FELICA_PURSE_USER_DATA_OFFSET    (8U)
+#define FELICA_PURSE_USER_DATA_SIZE      (6U)
+#define FELICA_PURSE_EXECUTION_ID_OFFSET (14U)
+#define FELICA_PURSE_EXECUTION_ID_SIZE   (2U)
+
+/** @brief Access Mode of a Block List Element, bits 6:4 of its first byte.
+  * Reference: FeliCa Card User's Manual Excerpted Edition v2.0, section 4.2. */
+#define FELICA_BLOCK_LIST_ACCESS_MODE_NORMAL     (0b000)
+#define FELICA_BLOCK_LIST_ACCESS_MODE_CASHBACK   (0b001)
+#define FELICA_BLOCK_LIST_ACCESS_MODE_KEY_CHANGE (0b100)
+
+static inline bool felica_service_attr_is_purse(uint8_t attr) {
+    return (attr & FELICA_SERVICE_ATTRIBUTE_PURSE) != 0;
+}
+
+static inline bool felica_service_attr_is_cyclic(uint8_t attr) {
+    return !felica_service_attr_is_purse(attr) &&
+           ((attr & FELICA_SERVICE_ATTRIBUTE_CYCLIC_FLAG) != 0);
+}
+
+/** @brief Purse sub-attribute of a Purse Service. Meaningless for other Services. */
+static inline uint8_t felica_service_attr_purse_mode(uint8_t attr) {
+    return (uint8_t)((attr & FELICA_SERVICE_ATTRIBUTE_PURSE_SUBFIELD) >> 1);
+}
+
+static inline bool felica_service_attr_is_read_only(uint8_t attr) {
+    // On a Purse Service, Read Only Access is the whole two-bit sub-attribute 0b11.
+    // Bit 1 on its own also marks Cashback/Decrement Access, which is writable.
+    return felica_service_attr_is_purse(attr) ?
+               (felica_service_attr_purse_mode(attr) == FELICA_SERVICE_PURSE_MODE_READ_ONLY) :
+               ((attr & FELICA_SERVICE_ATTRIBUTE_READ_ONLY) != 0);
+}
+
+static inline bool felica_service_attr_needs_auth(uint8_t attr) {
+    return (attr & FELICA_SERVICE_ATTRIBUTE_UNAUTH_READ) == 0;
+}
+
+/** @brief Whether the Service Attribute grants the Purse Service cashback function. */
+static inline bool felica_service_attr_has_cashback(uint8_t attr) {
+    return felica_service_attr_is_purse(attr) &&
+           (felica_service_attr_purse_mode(attr) == FELICA_SERVICE_PURSE_MODE_CASHBACK_DECREMENT);
+}
 
 /** @brief Type of possible Felica errors */
 typedef enum {
